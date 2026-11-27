@@ -965,15 +965,21 @@ object BoardVisionAnalyzer {
             }
         }
 
-        // Allow up to 1 stray mid-rank artifact on heavily textured themes while still requiring
-        // near-full starting back two ranks on both sides (opening moves vacate a rank 2/7 square).
-        if (midOccupied <= 1) {
-            val whiteStart = topBlack >= 14 && botWhite >= 14 && (midOccupied == 0 || (topBlack >= 15 && botWhite >= 16) || (topBlack >= 16 && botWhite >= 15))
-            if (whiteStart) {
+        // On a true starting position with 0 mid-rank pieces, allow up to 2 occluded back-rank pieces.
+        // If 1 stray mid-rank artifact appears on a textured board, require ALL 16 pieces intact on
+        // BOTH sides so legal opening moves (1. e4 / 1. Nf3 -> 15 + 16 + 1) NEVER trigger a false reset!
+        if (midOccupied == 0) {
+            if (topBlack >= 14 && botWhite >= 14) {
                 return StartPositionDetection(isStartPosition = true, playingAsWhite = true)
             }
-            val blackStart = topWhite >= 14 && botBlack >= 14 && (midOccupied == 0 || (topWhite >= 15 && botBlack >= 16) || (topWhite >= 16 && botBlack >= 15))
-            if (blackStart) {
+            if (topWhite >= 14 && botBlack >= 14) {
+                return StartPositionDetection(isStartPosition = true, playingAsWhite = false)
+            }
+        } else if (midOccupied == 1) {
+            if (topBlack == 16 && botWhite == 16) {
+                return StartPositionDetection(isStartPosition = true, playingAsWhite = true)
+            }
+            if (topWhite == 16 && botBlack == 16) {
                 return StartPositionDetection(isStartPosition = true, playingAsWhite = false)
             }
         }
