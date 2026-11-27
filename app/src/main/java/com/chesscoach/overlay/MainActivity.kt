@@ -1,12 +1,15 @@
 package com.chesscoach.overlay
 
 import android.Manifest
+import android.app.Activity
 import android.app.AlertDialog
 import android.content.ActivityNotFoundException
+import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Color
 import android.graphics.Typeface
+import android.media.projection.MediaProjectionManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -21,8 +24,10 @@ import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.appcompat.widget.AppCompatButton
+import androidx.appcompat.widget.SwitchCompat
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import com.chesscoach.overlay.data.OverlayPrefs
@@ -41,8 +46,24 @@ class MainActivity : AppCompatActivity() {
     private lateinit var tvPermissionStatus: TextView
     private lateinit var tvEngineStatus: TextView
     private lateinit var tvCurrentConfig: TextView
+    private lateinit var swAutoReadBoardMain: SwitchCompat
     private lateinit var btnGrantPermission: AppCompatButton
     private lateinit var btnToggleOverlay: AppCompatButton
+
+    private val screenCaptureLauncher = registerForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        if (result.resultCode == Activity.RESULT_OK && result.data != null) {
+            launchOverlayServiceAndChessApp(result.resultCode, result.data)
+        } else {
+            Toast.makeText(
+                this,
+                "Screen capture declined — starting in Manual Tap mode",
+                Toast.LENGTH_SHORT
+            ).show()
+            launchOverlayServiceAndChessApp(Activity.RESULT_CANCELED, null)
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -58,8 +79,14 @@ class MainActivity : AppCompatActivity() {
         tvPermissionStatus = findViewById(R.id.tvPermissionStatus)
         tvEngineStatus = findViewById(R.id.tvEngineStatus)
         tvCurrentConfig = findViewById(R.id.tvCurrentConfig)
+        swAutoReadBoardMain = findViewById(R.id.swAutoReadBoardMain)
         btnGrantPermission = findViewById(R.id.btnGrantPermission)
         btnToggleOverlay = findViewById(R.id.btnToggleOverlay)
+
+        swAutoReadBoardMain.isChecked = prefs.autoReadScreen
+        swAutoReadBoardMain.setOnCheckedChangeListener { _, checked ->
+            prefs.autoReadScreen = checked
+        }
 
         cardSelectedApp.setOnClickListener {
             showAppPickerDialog()
@@ -79,6 +106,24 @@ class MainActivity : AppCompatActivity() {
 
         requestNotificationPermissionIfNeeded()
         updateUi()
+        handleAutoReadRequestIntent(intent)
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleAutoReadRequestIntent(intent)
+    }
+
+    private fun handleAutoReadRequestIntent(intent: Intent?) {
+        if (intent?.getBooleanExtra(EXTRA_REQUEST_AUTO_READ, false) == true) {
+            intent.removeExtra(EXTRA_REQUEST_AUTO_READ)
+            if (Settings.canDrawOverlays(this)) {
+                prefs.autoReadScreen = true
+                swAutoReadBoardMain.isChecked = true
+                requestScreenCaptureOrStartManual()
+            }
+        }
     }
 
     override fun onResume() {
@@ -105,6 +150,7 @@ class MainActivity : AppCompatActivity() {
             "Engine: Offline Pure-Kotlin Chess Engine • ∞ Moves/Day"
         }
 
+        swAutoReadBoardMain.isChecked = prefs.autoReadScreen
         tvCurrentConfig.text =
             "Elo ${prefs.targetElo} • Accuracy ${prefs.targetAccuracy}% • Depth ${prefs.searchDepth} • ${prefs.playStyle.label}"
 
@@ -186,10 +232,40 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
+        if (prefs.autoReadScreen) {
+            requestScreenCaptureOrStartManual()
+        } else {
+            launchOverlayServiceAndChessApp(Activity.RESULT_CANCELED, null)
+        }
+    }
+
+    private fun requestScreenCaptureOrStartManual() {
+        val mpm = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as? MediaProjectionManager
+        if (mpm == null) {
+            launchOverlayServiceAndChessApp(Activity.RESULT_CANCELED, null)
+            return
+        }
+        try {
+            screenCaptureLauncher.launch(mpm.createScreenCaptureIntent())
+        } catch (_: Throwable) {
+            Toast.makeText(
+                this,
+                "Screen capture unavailable — starting in Manual Tap mode",
+                Toast.LENGTH_SHORT
+            ).show()
+            launchOverlayServiceAndChessApp(Activity.RESULT_CANCELED, null)
+        }
+    }
+
+    private fun launchOverlayServiceAndChessApp(projectionResultCode: Int, projectionData: Intent?) {
         val targetPkg = prefs.selectedAppPackage
         val serviceIntent = Intent(this, OverlayService::class.java).apply {
-            action = OverlayService.ACTION_UPDATE_TARGET_APP
+            action = OverlayService.ACTION_START_OVERLAY
             putExtra(OverlayService.EXTRA_TARGET_PACKAGE, targetPkg)
+            putExtra(OverlayService.EXTRA_PROJECTION_RESULT_CODE, projectionResultCode)
+            if (projectionData != null) {
+                putExtra(OverlayService.EXTRA_PROJECTION_DATA, projectionData)
+            }
         }
         ContextCompat.startForegroundService(this, serviceIntent)
 
@@ -498,5 +574,6 @@ class MainActivity : AppCompatActivity() {
 
     companion object {
         private const val REQ_NOTIF = 1001
+        const val EXTRA_REQUEST_AUTO_READ = "extra_request_auto_read"
     }
 }

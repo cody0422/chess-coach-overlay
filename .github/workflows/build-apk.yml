@@ -92,14 +92,15 @@ jobs:
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v1.0.0
-          name: ChessCoachOverlay v1.0.0
+          tag_name: v2.0.0
+          name: ChessCoachOverlay v2.0.0
           body: |
-            ## ChessCoachOverlay v1.0.0
-            - Floating dark chess coach overlay (`SYSTEM_ALERT_WINDOW`) with draggable pill bar & resizable 8x8 board frame
-            - Adjustable target Elo slider (**400 to 4000 Elo**, step 50) + search depth slider (1–8)
-            - **Infinite moves/day** — 100% offline engine (bundled Stockfish 17 arm64 with automatic pure-Kotlin fallback)
-            - Best-move emerald arrows, evaluation bar, move quality feedback, board warnings, pinned piece highlights, and pass-through touch toggle
+            ## ChessCoachOverlay v2.0.0
+            - **Hands-Free Auto Board Reading (Android 14+ MediaProjection):** Automatically locates your 8×8 chess board on screen, detects board orientation & new games, and tracks both sides' legal moves live (Chess.com, Lichess, Splend, any board theme!)
+            - **Auto-Hides on Menus:** Clears off Chess.com Home/menu screens automatically and snaps right back when a game board appears
+            - **Sleek 3-Button Glass Pill Bar:** Minimal draggable `[ ▶ | ≡ | ✕ ]` pill bar with live status dot, manual controls tucked cleanly inside Settings
+            - **Single Clean Translucent Green Arrow:** Uncluttered pass-through overlay with 1 bold best-move arrow (zero border box, piece dots OFF by default, optional eval bar / warnings / pinned pieces / line risks)
+            - **100% Offline Stockfish 17 ARM64 + Pure-Kotlin Fallback:** Adjustable **400–4000 Elo**, **50%–100% Accuracy**, **Depth 1–8**, **Play Styles (Default · Aggressive · Passive · Human)**, and **∞ Unlimited Moves/Day**
           files: |
             ChessCoachOverlay.apk
           make_latest: true

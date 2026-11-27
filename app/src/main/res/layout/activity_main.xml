@@ -178,6 +178,49 @@
                 android:textColor="@color/text_secondary"
                 android:textSize="13sp" />
 
+            <!-- Auto-Read Board (Screen Capture) Toggle -->
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="12dp"
+                android:background="@drawable/bg_button_secondary"
+                android:gravity="center_vertical"
+                android:orientation="horizontal"
+                android:paddingHorizontal="12dp"
+                android:paddingVertical="10dp">
+
+                <LinearLayout
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:orientation="vertical">
+
+                    <TextView
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:text="Auto-Read Board (Screen Capture)"
+                        android:textColor="@color/text_primary"
+                        android:textSize="14sp"
+                        android:textStyle="bold" />
+
+                    <TextView
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:layout_marginTop="2dp"
+                        android:text="Detects board &amp; moves automatically, hides on menus"
+                        android:textColor="@color/text_secondary"
+                        android:textSize="11sp" />
+                </LinearLayout>
+
+                <androidx.appcompat.widget.SwitchCompat
+                    android:id="@+id/swAutoReadBoardMain"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:checked="true"
+                    android:thumbTint="@color/switch_thumb_tint"
+                    android:trackTint="@color/switch_track_tint" />
+            </LinearLayout>
+
             <androidx.appcompat.widget.AppCompatButton
                 android:id="@+id/btnGrantPermission"
                 android:layout_width="match_parent"
@@ -235,7 +278,7 @@
                 android:layout_height="wrap_content"
                 android:layout_marginTop="10dp"
                 android:lineSpacingExtra="4dp"
-                android:text="1. Pick your chess app above, grant Overlay Permission, and tap Start Overlay — your chess app opens automatically."
+                android:text="1. Pick your chess app above, grant Overlay Permission, and tap Start Overlay. Tap Allow on the Screen Capture prompt (recommended) — your chess app opens right away."
                 android:textColor="@color/text_secondary"
                 android:textSize="14sp" />
 
@@ -244,7 +287,7 @@
                 android:layout_height="wrap_content"
                 android:layout_marginTop="8dp"
                 android:lineSpacingExtra="4dp"
-                android:text="2. Tap Align on the floating pill bar to drag &amp; resize the 8×8 frame over the board, then tap Lock. Position is saved per app."
+                android:text="2. The overlay stays hidden on menus and automatically snaps onto your 8×8 board the moment a game starts, tracking every move hands-free in Pass-Through mode."
                 android:textColor="@color/text_secondary"
                 android:textSize="14sp" />
 
@@ -253,7 +296,7 @@
                 android:layout_height="wrap_content"
                 android:layout_marginTop="8dp"
                 android:lineSpacingExtra="4dp"
-                android:text="3. Tap source → destination squares in Tap Mode for live emerald arrows, or toggle Pass-through (eye icon) so touches pass straight to the board underneath."
+                android:text="3. Use the sleek 3-button pill bar ([ ▶ | ≡ | ✕ ]) to pause/resume arrows, open Settings, or close. Drag anywhere on the pill to reposition."
                 android:textColor="@color/text_secondary"
                 android:textSize="14sp" />
 
@@ -262,7 +305,7 @@
                 android:layout_height="wrap_content"
                 android:layout_marginTop="10dp"
                 android:lineSpacingExtra="4dp"
-                android:text="Tip: Tap ☰ on the pill bar anytime for Elo (400–4000), Accuracy (50%–100%), Play Style (Default / Aggressive / Passive / Human), Depth, Eval Bar, Warnings, and Pinned Pieces."
+                android:text="Tip: Tap ≡ on the pill bar anytime for Elo (400–4000), Accuracy (50%–100%), Play Style, Depth, Eval Bar, Warnings, Pinned Pieces, Line Risks, or manual Align/Tap mode."
                 android:textColor="@color/accent_emerald"
                 android:textSize="13sp" />
         </LinearLayout>

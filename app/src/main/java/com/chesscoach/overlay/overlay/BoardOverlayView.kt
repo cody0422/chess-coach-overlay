@@ -13,6 +13,7 @@ import com.chesscoach.overlay.engine.AnalysisResult
 import com.chesscoach.overlay.engine.BoardWarning
 import com.chesscoach.overlay.engine.ChessBoard
 import com.chesscoach.overlay.engine.GameStatus
+import com.chesscoach.overlay.engine.LineRisk
 import com.chesscoach.overlay.engine.Move
 import com.chesscoach.overlay.engine.MoveFeedback
 import com.chesscoach.overlay.engine.Piece
@@ -35,7 +36,7 @@ enum class OverlayMode {
 
 class BoardOverlayView(context: Context) : View(context) {
 
-    var mode: OverlayMode = OverlayMode.TAP_MOVE
+    var mode: OverlayMode = OverlayMode.PASS_THROUGH
         set(value) {
             field = value
             selectedSquare = -1
@@ -56,13 +57,13 @@ class BoardOverlayView(context: Context) : View(context) {
             invalidate()
         }
 
-    var showMultiArrows: Boolean = true
+    var showMultiArrows: Boolean = false
         set(value) {
             field = value
             invalidate()
         }
 
-    var showEvalBar: Boolean = true
+    var showEvalBar: Boolean = false
         set(value) {
             field = value
             invalidate()
@@ -74,13 +75,19 @@ class BoardOverlayView(context: Context) : View(context) {
             invalidate()
         }
 
-    var showPinnedPieces: Boolean = true
+    var showPinnedPieces: Boolean = false
         set(value) {
             field = value
             invalidate()
         }
 
-    var showPieceMarkers: Boolean = true
+    var showLineRisks: Boolean = false
+        set(value) {
+            field = value
+            invalidate()
+        }
+
+    var showPieceMarkers: Boolean = false
         set(value) {
             field = value
             invalidate()
@@ -95,6 +102,7 @@ class BoardOverlayView(context: Context) : View(context) {
     private var boardSnapshot: ChessBoard = ChessBoard()
     private var analysis: AnalysisResult? = null
     private var pinnedPieces: List<PinnedPiece> = emptyList()
+    private var lineRisks: List<LineRisk> = emptyList()
     private var warnings: List<BoardWarning> = emptyList()
     private var lastFeedback: MoveFeedback? = null
     private var gameStatus: GameStatus = GameStatus.ONGOING
@@ -134,9 +142,23 @@ class BoardOverlayView(context: Context) : View(context) {
         strokeWidth = 1f * density
     }
     private val subtleBorderPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.argb(95, 25, 229, 143)
+        color = Color.TRANSPARENT
         style = Paint.Style.STROKE
-        strokeWidth = 1.2f * density
+        strokeWidth = 0f
+    }
+    private val lineRiskDirectPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.argb(215, 239, 68, 68)
+        style = Paint.Style.STROKE
+        strokeWidth = 2.6f * density
+        strokeCap = Paint.Cap.ROUND
+        pathEffect = DashPathEffect(floatArrayOf(8f * density, 5f * density), 0f)
+    }
+    private val lineRiskXrayPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.argb(190, 249, 115, 22)
+        style = Paint.Style.STROKE
+        strokeWidth = 2.2f * density
+        strokeCap = Paint.Cap.ROUND
+        pathEffect = DashPathEffect(floatArrayOf(6f * density, 5f * density), 0f)
     }
     private val handleFillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = Color.parseColor("#19E58F")
@@ -212,7 +234,7 @@ class BoardOverlayView(context: Context) : View(context) {
         isFakeBoldText = true
     }
     private val arrowOutlinePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.argb(175, 8, 12, 18)
+        color = Color.argb(170, 15, 81, 50)
         style = Paint.Style.STROKE
         strokeCap = Paint.Cap.ROUND
         strokeJoin = Paint.Join.ROUND
@@ -255,11 +277,13 @@ class BoardOverlayView(context: Context) : View(context) {
         boardWarnings: List<BoardWarning>,
         feedback: MoveFeedback?,
         status: GameStatus,
-        analyzing: Boolean
+        analyzing: Boolean,
+        risks: List<LineRisk> = emptyList()
     ) {
         boardSnapshot = board.copy()
         analysis = analysisResult
         pinnedPieces = pins
+        lineRisks = risks
         warnings = boardWarnings
         lastFeedback = feedback
         gameStatus = status
@@ -321,15 +345,12 @@ class BoardOverlayView(context: Context) : View(context) {
             return
         }
 
-        // Subtle outer border in TAP_MOVE mode so user knows overlay is active
+        // Clean zero-border pass-through play; only highlight last move softly in manual TAP_MOVE mode
         if (mode == OverlayMode.TAP_MOVE) {
-            canvas.drawRect(1f, 1f, width - 1f, height - 1f, subtleBorderPaint)
-        }
-
-        // Highlight last move softly
-        boardSnapshot.lastMove()?.let { lm ->
-            canvas.drawRect(squareRect(lm.from), lastMovePaint)
-            canvas.drawRect(squareRect(lm.to), lastMovePaint)
+            boardSnapshot.lastMove()?.let { lm ->
+                canvas.drawRect(squareRect(lm.from), lastMovePaint)
+                canvas.drawRect(squareRect(lm.to), lastMovePaint)
+            }
         }
 
         // Highlight selected square & legal destination markers
@@ -354,6 +375,11 @@ class BoardOverlayView(context: Context) : View(context) {
         // Pinned pieces
         if (showPinnedPieces) {
             drawPinnedPieces(canvas, minSq)
+        }
+
+        // Line risks (enemy sliding-piece attack/x-ray lines onto King/Queen)
+        if (showLineRisks) {
+            drawLineRisks(canvas, minSq)
         }
 
         // Optional subtle piece markers so tracked board state is clear
@@ -502,6 +528,16 @@ class BoardOverlayView(context: Context) : View(context) {
         }
     }
 
+    private fun drawLineRisks(canvas: Canvas, minSq: Float) {
+        for (risk in lineRisks) {
+            val (ax, ay) = squareCenter(risk.attackerSquare)
+            val (tx, ty) = squareCenter(risk.targetSquare)
+            val paint = if (risk.isDirectAttack) lineRiskDirectPaint else lineRiskXrayPaint
+            canvas.drawLine(ax, ay, tx, ty, paint)
+            canvas.drawCircle(tx, ty, minSq * 0.36f, paint)
+        }
+    }
+
     private fun drawCornerBadge(
         canvas: Canvas,
         sqRect: RectF,
@@ -531,46 +567,57 @@ class BoardOverlayView(context: Context) : View(context) {
         if (dist < 1f) return
 
         val angle = atan2(dy, dx)
+        val cosA = cos(angle)
+        val sinA = sin(angle)
+        val perpX = -sinA
+        val perpY = cosA
 
+        // Clean Chess & Checkers Assistant / Chess.com translucent emerald vector arrow
         val (arrowColor, shaftWidth, headLen, headHalfW) = when (rankIndex) {
-            0 -> Quad(Color.argb(230, 25, 229, 143), minSq * 0.21f, minSq * 0.42f, minSq * 0.30f)
-            1 -> Quad(Color.argb(150, 56, 189, 248), minSq * 0.15f, minSq * 0.34f, minSq * 0.24f)
-            else -> Quad(Color.argb(120, 251, 191, 36), minSq * 0.12f, minSq * 0.30f, minSq * 0.21f)
+            0 -> Quad(Color.argb(212, 34, 197, 94), minSq * 0.20f, minSq * 0.44f, minSq * 0.32f)
+            1 -> Quad(Color.argb(148, 56, 189, 248), minSq * 0.14f, minSq * 0.34f, minSq * 0.24f)
+            else -> Quad(Color.argb(122, 251, 191, 36), minSq * 0.12f, minSq * 0.30f, minSq * 0.21f)
         }
 
-        // Start slightly offset from center & stop shaft at arrowhead base
-        val startOffset = minSq * 0.12f
-        val sx = x1 + cos(angle) * startOffset
-        val sy = y1 + sin(angle) * startOffset
-        val tipX = x2 - cos(angle) * (minSq * 0.06f)
-        val tipY = y2 - sin(angle) * (minSq * 0.06f)
-        val baseX = tipX - cos(angle) * headLen
-        val baseY = tipY - sin(angle) * headLen
+        val shaftHalfW = shaftWidth * 0.5f
+        val startOffset = minSq * 0.10f
+        val tailX = x1 + cosA * startOffset
+        val tailY = y1 + sinA * startOffset
+        val tipX = x2 - cosA * (minSq * 0.04f)
+        val tipY = y2 - sinA * (minSq * 0.04f)
+        val effHeadLen = min(headLen, dist * 0.48f)
+        val baseX = tipX - cosA * effHeadLen
+        val baseY = tipY - sinA * effHeadLen
 
-        val perpX = -sin(angle)
-        val perpY = cos(angle)
+        // Single unified closed vector path (rounded tail + straight shaft + wide arrowhead)
+        // eliminating any semi-transparent alpha overlap seam!
+        val tailCapR = shaftHalfW
+        val tailRect = RectF(
+            tailX - tailCapR,
+            tailY - tailCapR,
+            tailX + tailCapR,
+            tailY + tailCapR
+        )
+        val angleDeg = Math.toDegrees(angle.toDouble()).toFloat()
 
-        val headPath = Path().apply {
-            moveTo(tipX, tipY)
+        val arrowPath = Path().apply {
+            moveTo(baseX + perpX * shaftHalfW, baseY + perpY * shaftHalfW)
             lineTo(baseX + perpX * headHalfW, baseY + perpY * headHalfW)
+            lineTo(tipX, tipY)
             lineTo(baseX - perpX * headHalfW, baseY - perpY * headHalfW)
+            lineTo(baseX - perpX * shaftHalfW, baseY - perpY * shaftHalfW)
+            lineTo(tailX - perpX * shaftHalfW, tailY - perpY * shaftHalfW)
+            arcTo(tailRect, angleDeg - 90f, -180f, false)
             close()
         }
 
-        // Soft dark outline behind primary arrow for crisp contrast on bright squares
-        if (rankIndex == 0) {
-            arrowOutlinePaint.strokeWidth = shaftWidth + 3f * density
-            canvas.drawLine(sx, sy, baseX, baseY, arrowOutlinePaint)
-            arrowOutlinePaint.strokeWidth = 3f * density
-            canvas.drawPath(headPath, arrowOutlinePaint)
-        }
-
-        arrowLinePaint.color = arrowColor
-        arrowLinePaint.strokeWidth = shaftWidth
-        canvas.drawLine(sx, sy, baseX, baseY, arrowLinePaint)
-
         arrowFillPaint.color = arrowColor
-        canvas.drawPath(headPath, arrowFillPaint)
+        canvas.drawPath(arrowPath, arrowFillPaint)
+
+        if (rankIndex == 0) {
+            arrowOutlinePaint.strokeWidth = 2.0f * density
+            canvas.drawPath(arrowPath, arrowOutlinePaint)
+        }
     }
 
     private data class Quad(val color: Int, val shaft: Float, val headLen: Float, val headHalfW: Float)
@@ -648,7 +695,6 @@ class BoardOverlayView(context: Context) : View(context) {
             gameStatus == GameStatus.STALEMATE -> "Stalemate"
             gameStatus == GameStatus.DRAW_INSUFFICIENT -> "Draw • Insufficient Material"
             gameStatus == GameStatus.DRAW_FIFTY_MOVE -> "Draw • 50-Move Rule"
-            isAnalyzing -> "Analyzing..."
             else -> return
         }
         pillTextPaint.textSize = 11f * density

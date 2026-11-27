@@ -141,6 +141,13 @@ data class BoardWarning(
     val attackerSquare: Int = -1
 )
 
+data class LineRisk(
+    val attackerSquare: Int,
+    val targetSquare: Int,
+    val blockerSquare: Int = -1,
+    val isDirectAttack: Boolean = false
+)
+
 
 enum class PlayStyle(val label: String, val shortTag: String) {
     DEFAULT("Default", "DEF"),

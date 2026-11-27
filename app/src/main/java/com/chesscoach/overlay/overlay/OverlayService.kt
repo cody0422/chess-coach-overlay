@@ -1,5 +1,6 @@
 package com.chesscoach.overlay.overlay
 
+import android.app.Activity
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -10,6 +11,7 @@ import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.graphics.Color
 import android.graphics.PixelFormat
+import android.graphics.drawable.GradientDrawable
 import android.os.Build
 import android.os.IBinder
 import android.provider.Settings
@@ -20,7 +22,8 @@ import android.view.MotionEvent
 import android.view.View
 import android.view.WindowManager
 import android.widget.ImageButton
-import android.widget.TextView
+import android.widget.ImageView
+import android.widget.Toast
 import androidx.core.app.NotificationCompat
 import com.chesscoach.overlay.MainActivity
 import com.chesscoach.overlay.R
@@ -31,8 +34,12 @@ import com.chesscoach.overlay.engine.ChessBoard
 import com.chesscoach.overlay.engine.Move
 import com.chesscoach.overlay.engine.MoveFeedback
 import com.chesscoach.overlay.engine.Piece
-import com.chesscoach.overlay.engine.PlayStyle
 import com.chesscoach.overlay.engine.StockfishUciEngine
+import com.chesscoach.overlay.vision.BoardTrackingEvent
+import com.chesscoach.overlay.vision.BoardTrackingSession
+import com.chesscoach.overlay.vision.FrameAnalysis
+import com.chesscoach.overlay.vision.PixelRect
+import com.chesscoach.overlay.vision.ScreenBoardReader
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -59,16 +66,23 @@ class OverlayService : Service() {
     private var lastFeedback: MoveFeedback? = null
 
     private var activeTargetPackage: String = ""
-    private var currentMode: OverlayMode = OverlayMode.TAP_MOVE
+    private var currentMode: OverlayMode = OverlayMode.PASS_THROUGH
+    private var overlayArrowsActive: Boolean = true
+
+    // Screen-capture auto-read state
+    private var screenBoardReader: ScreenBoardReader? = null
+    private val trackingSession = BoardTrackingSession()
+    private var hasMediaProjectionGrant: Boolean = false
+    private var autoBoardDetectedVisible: Boolean = false
+    private var manualAlignLocked: Boolean = false
 
     private var boardView: BoardOverlayView? = null
     private var boardParams: WindowManager.LayoutParams? = null
 
     private var pillView: View? = null
     private var pillParams: WindowManager.LayoutParams? = null
-    private var tvPillStats: TextView? = null
-    private var btnPillAlign: ImageButton? = null
-    private var btnPillTouchMode: ImageButton? = null
+    private var ivPillPlay: ImageView? = null
+    private var viewPillStatusDot: View? = null
 
     private var settingsController: SettingsModalController? = null
     private var settingsAttached = false
@@ -85,12 +99,16 @@ class OverlayService : Service() {
         engine = StockfishUciEngine(this)
         activeTargetPackage = prefs.selectedAppPackage
 
-        startAsForegroundService()
+        // Start foreground immediately with specialUse; onStartCommand upgrades to
+        // specialUse|mediaProjection BEFORE requesting MediaProjection on Android 14+.
+        startAsForegroundService(includeMediaProjection = false)
 
         if (!Settings.canDrawOverlays(this)) {
             stopSelf()
             return
         }
+
+        currentMode = if (prefs.tapInputMode) OverlayMode.TAP_MOVE else OverlayMode.PASS_THROUGH
 
         setupBoardOverlay()
         setupPillBar()
@@ -111,18 +129,52 @@ class OverlayService : Service() {
                 stopSelf()
                 return START_NOT_STICKY
             }
-            ACTION_UPDATE_TARGET_APP -> {
+            ACTION_START_OVERLAY, ACTION_UPDATE_TARGET_APP -> {
                 val pkg = intent.getStringExtra(EXTRA_TARGET_PACKAGE) ?: prefs.selectedAppPackage
                 if (pkg != activeTargetPackage) {
                     activeTargetPackage = pkg
+                    manualAlignLocked = false
+                    screenBoardReader?.lockedScreenRect = null
                     reloadBoardRectForActiveApp()
+                }
+
+                val projCode = intent.getIntExtra(EXTRA_PROJECTION_RESULT_CODE, Activity.RESULT_CANCELED)
+                val projData: Intent? = extractProjectionData(intent)
+
+                if (projCode == Activity.RESULT_OK && projData != null && prefs.autoReadScreen) {
+                    // CRITICAL Android 14 (API 34) lifecycle order:
+                    // 1. Upgrade foreground service type to include MEDIA_PROJECTION FIRST
+                    startAsForegroundService(includeMediaProjection = true)
+                    // 2. THEN call getMediaProjection -> registerCallback -> createVirtualDisplay
+                    startScreenCapture(projCode, projData)
+                } else if (intent.action == ACTION_START_OVERLAY && !hasMediaProjectionGrant) {
+                    // Started without screen capture (user disabled Auto-Read or declined prompt)
+                    stopScreenCapture()
+                    if (!prefs.autoReadScreen) {
+                        setOverlayMode(if (prefs.tapInputMode) OverlayMode.TAP_MOVE else OverlayMode.PASS_THROUGH)
+                    } else {
+                        // Declined prompt -> default cleanly into manual Tap mode
+                        prefs.tapInputMode = true
+                        setOverlayMode(OverlayMode.TAP_MOVE)
+                    }
+                    updateBoardVisibility()
+                    updatePillVisualState()
                 }
             }
         }
         return START_STICKY
     }
 
-    private fun startAsForegroundService() {
+    @Suppress("DEPRECATION")
+    private fun extractProjectionData(intent: Intent): Intent? {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            intent.getParcelableExtra(EXTRA_PROJECTION_DATA, Intent::class.java)
+        } else {
+            intent.getParcelableExtra(EXTRA_PROJECTION_DATA)
+        }
+    }
+
+    private fun startAsForegroundService(includeMediaProjection: Boolean) {
         val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
         val channel = NotificationChannel(
             CHANNEL_ID,
@@ -153,10 +205,16 @@ class OverlayService : Service() {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
+        val notifText = if (includeMediaProjection) {
+            "Auto-reading chess board • Offline Stockfish • ∞ moves"
+        } else {
+            getString(R.string.overlay_running_notif_text)
+        }
+
         val notification: Notification = NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_notification)
             .setContentTitle(getString(R.string.overlay_running_notif_title))
-            .setContentText(getString(R.string.overlay_running_notif_text))
+            .setContentText(notifText)
             .setOngoing(true)
             .setPriority(NotificationCompat.PRIORITY_LOW)
             .setContentIntent(openPending)
@@ -164,19 +222,203 @@ class OverlayService : Service() {
             .build()
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            val fgsType = if (includeMediaProjection) {
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE or
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
+            } else {
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+            }
+            startForeground(NOTIFICATION_ID, notification, fgsType)
+        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && includeMediaProjection) {
             startForeground(
                 NOTIFICATION_ID,
                 notification,
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
             )
         } else {
             startForeground(NOTIFICATION_ID, notification)
         }
     }
 
+    private fun startScreenCapture(resultCode: Int, projectionData: Intent) {
+        stopScreenCapture()
+        trackingSession.resetTracking()
+        autoBoardDetectedVisible = false
+
+        val reader = ScreenBoardReader(
+            context = this,
+            onFrameAnalyzed = { analysis -> handleScreenFrame(analysis) },
+            onProjectionStopped = {
+                hasMediaProjectionGrant = false
+                autoBoardDetectedVisible = false
+                updateBoardVisibility()
+                updatePillVisualState()
+                settingsController?.syncFromPrefs()
+            }
+        )
+
+        if (manualAlignLocked) {
+            boardParams?.let { bp ->
+                reader.lockedScreenRect = PixelRect(bp.x, bp.y, bp.width, bp.height)
+            }
+        }
+
+        val ok = reader.start(resultCode, projectionData)
+        if (ok) {
+            screenBoardReader = reader
+            hasMediaProjectionGrant = true
+            // Start cleanly in Pass-Through mode so user plays right on Chess.com immediately!
+            prefs.tapInputMode = false
+            setOverlayMode(OverlayMode.PASS_THROUGH)
+            // Keep board overlay hidden until an actual 8x8 chess board appears on screen
+            updateBoardVisibility()
+            updatePillVisualState()
+        } else {
+            hasMediaProjectionGrant = false
+            Toast.makeText(
+                this,
+                "Screen capture unavailable — switched to Manual mode",
+                Toast.LENGTH_SHORT
+            ).show()
+            updateBoardVisibility()
+            updatePillVisualState()
+        }
+    }
+
+    private fun stopScreenCapture() {
+        screenBoardReader?.stop()
+        screenBoardReader = null
+        hasMediaProjectionGrant = false
+        autoBoardDetectedVisible = false
+        trackingSession.resetTracking()
+    }
+
+    private fun isAutoReadLive(): Boolean {
+        return prefs.autoReadScreen && hasMediaProjectionGrant && (screenBoardReader?.isActive == true)
+    }
+
+    private fun handleScreenFrame(analysis: FrameAnalysis) {
+        if (!isAutoReadLive()) return
+        // Don't fight the user while dragging/resizing in Align mode or browsing Settings
+        if (currentMode == OverlayMode.ALIGN || settingsAttached) return
+
+        val events = trackingSession.onFrame(
+            analysis = analysis,
+            currentBoard = board,
+            currentPlayingAsWhite = prefs.playingAsWhite
+        )
+
+        for (ev in events) {
+            when (ev) {
+                is BoardTrackingEvent.BoardHidden -> {
+                    autoBoardDetectedVisible = false
+                    updateBoardVisibility()
+                    updatePillVisualState()
+                }
+                is BoardTrackingEvent.BoardVisible -> {
+                    autoBoardDetectedVisible = true
+                    if (!manualAlignLocked) {
+                        snapBoardOverlayToRect(ev.rect)
+                    }
+                    updateBoardVisibility()
+                    updatePillVisualState()
+                }
+                is BoardTrackingEvent.NewGameDetected -> {
+                    autoBoardDetectedVisible = true
+                    if (!manualAlignLocked) {
+                        snapBoardOverlayToRect(ev.rect)
+                    }
+                    prefs.playingAsWhite = ev.playingAsWhite
+                    board.reset()
+                    lastAnalysis = null
+                    lastFeedback = null
+                    applyPrefsToViews()
+                    updateBoardVisibility()
+                    updatePillVisualState()
+                    triggerAnalysis()
+                }
+                is BoardTrackingEvent.MovesDetected -> {
+                    autoBoardDetectedVisible = true
+                    if (!manualAlignLocked) {
+                        snapBoardOverlayToRect(ev.rect)
+                    }
+                    applyAutoDetectedMoves(ev.moves)
+                    updateBoardVisibility()
+                    updatePillVisualState()
+                }
+            }
+        }
+    }
+
+    private fun snapBoardOverlayToRect(rect: PixelRect) {
+        val bv = boardView ?: return
+        val bp = boardParams ?: return
+        if (rect.width < 120 || rect.height < 120) return
+
+        val changed = abs(bp.x - rect.left) > 3 ||
+            abs(bp.y - rect.top) > 3 ||
+            abs(bp.width - rect.width) > 3 ||
+            abs(bp.height - rect.height) > 3
+
+        if (changed) {
+            bp.x = rect.left
+            bp.y = rect.top
+            bp.width = rect.width
+            bp.height = rect.height
+            try {
+                windowManager.updateViewLayout(bv, bp)
+            } catch (_: Throwable) {
+            }
+        }
+    }
+
+    private fun applyAutoDetectedMoves(moves: List<Move>) {
+        if (moves.isEmpty()) return
+        val playerColor = if (prefs.playingAsWhite) Piece.WHITE else Piece.BLACK
+        var gradeBefore: ChessBoard? = null
+        var gradedMove: Move? = null
+        val cachedBestBefore = lastAnalysis?.topMoves?.firstOrNull()
+
+        for (m in moves) {
+            val before = board.copy()
+            val mover = before.sideToMove
+            if (!board.pushMove(m)) break
+            if (prefs.analyzeMyMoves && mover == playerColor) {
+                gradeBefore = before
+                gradedMove = m
+            }
+        }
+
+        lastAnalysis = null
+        if (gradedMove == null) {
+            lastFeedback = null
+        }
+
+        refreshBoardView(analyzing = true)
+        triggerAnalysis(
+            gradeBefore = gradeBefore,
+            gradedMove = gradedMove,
+            cachedBestBefore = if (moves.size == 1) cachedBestBefore else null
+        )
+    }
+
+    private fun updateBoardVisibility() {
+        val bv = boardView ?: return
+        val shouldShow = when {
+            currentMode == OverlayMode.ALIGN -> true
+            !overlayArrowsActive -> false
+            isAutoReadLive() -> autoBoardDetectedVisible
+            else -> true
+        }
+        val targetVis = if (shouldShow) View.VISIBLE else View.INVISIBLE
+        if (bv.visibility != targetVis) {
+            bv.visibility = targetVis
+        }
+    }
+
     private fun defaultBoardRect(): BoardRect {
         val dm = resources.displayMetrics
-        val size = (min(dm.widthPixels, dm.heightPixels) * 0.92f).toInt().coerceAtLeast(320)
+        val size = min(dm.widthPixels, dm.heightPixels).coerceAtLeast(320)
         val x = (dm.widthPixels - size) / 2
         val y = ((dm.heightPixels - size) * 0.48f).toInt().coerceAtLeast(80)
         return BoardRect(x, y, size, size)
@@ -212,6 +454,7 @@ class OverlayService : Service() {
         } catch (_: Throwable) {
             stopSelf()
         }
+        updateBoardVisibility()
     }
 
     private fun reloadBoardRectForActiveApp() {
@@ -253,7 +496,8 @@ class OverlayService : Service() {
             } catch (_: Throwable) {
             }
         }
-        updatePillButtonStates()
+        updateBoardVisibility()
+        updatePillVisualState()
     }
 
     private fun adjustBoardRect(dx: Int, dy: Int, dw: Int, dh: Int) {
@@ -269,7 +513,6 @@ class OverlayService : Service() {
         val appliedDw = newW - bp.width
         val appliedDh = newH - bp.height
 
-        // Only shift x/y proportionally when resizing from top/left corners
         val nextX = if (dw != 0 && dx != 0) bp.x - appliedDw else bp.x + dx
         val nextY = if (dh != 0 && dy != 0) bp.y - appliedDh else bp.y + dy
 
@@ -290,15 +533,18 @@ class OverlayService : Service() {
                 activeTargetPackage,
                 BoardRect(bp.x, bp.y, bp.width, bp.height)
             )
+            manualAlignLocked = true
+            screenBoardReader?.lockedScreenRect = PixelRect(bp.x, bp.y, bp.width, bp.height)
         }
-        setOverlayMode(OverlayMode.TAP_MOVE)
+        val nextMode = if (prefs.tapInputMode) OverlayMode.TAP_MOVE else OverlayMode.PASS_THROUGH
+        setOverlayMode(nextMode)
     }
 
     private fun setupPillBar() {
         val view = LayoutInflater.from(themedContext).inflate(R.layout.overlay_pill_bar, null)
         val dm = resources.displayMetrics
-        val defaultX = (12f * dm.density).toInt()
-        val defaultY = (44f * dm.density).toInt()
+        val defaultX = (dm.widthPixels * 0.22f).toInt().coerceAtLeast(16)
+        val defaultY = (40f * dm.density).toInt()
 
         val savedX = if (prefs.pillX >= 0) prefs.pillX else defaultX
         val savedY = if (prefs.pillY >= 0) prefs.pillY else defaultY
@@ -318,63 +564,38 @@ class OverlayService : Service() {
         pillView = view
         pillParams = params
 
-        tvPillStats = view.findViewById(R.id.tvPillStats)
-        btnPillAlign = view.findViewById(R.id.btnPillAlign)
-        btnPillTouchMode = view.findViewById(R.id.btnPillTouchMode)
+        val playContainer = view.findViewById<View>(R.id.btnPillPlayContainer)
+        ivPillPlay = view.findViewById(R.id.ivPillPlay)
+        viewPillStatusDot = view.findViewById(R.id.viewPillStatusDot)
+        val btnSettings = view.findViewById<ImageButton>(R.id.btnPillSettings)
+        val btnClose = view.findViewById<ImageButton>(R.id.btnPillClose)
 
-        view.findViewById<ImageButton>(R.id.btnPillAnalyze).setOnClickListener {
-            triggerAnalysis()
-        }
-        btnPillAlign?.setOnClickListener {
-            if (currentMode == OverlayMode.ALIGN) {
-                lockAlignment()
-            } else {
-                setOverlayMode(OverlayMode.ALIGN)
-            }
-        }
-        btnPillTouchMode?.setOnClickListener {
-            val next = if (currentMode == OverlayMode.PASS_THROUGH) {
-                OverlayMode.TAP_MOVE
-            } else {
-                OverlayMode.PASS_THROUGH
-            }
-            setOverlayMode(next)
-        }
-        view.findViewById<ImageButton>(R.id.btnPillFlip).setOnClickListener {
-            prefs.playingAsWhite = !prefs.playingAsWhite
-            applyPrefsToViews()
-            refreshBoardView(analyzing = false)
-        }
-        view.findViewById<ImageButton>(R.id.btnPillUndo).setOnClickListener {
-            if (board.undoLastMove() != null) {
-                lastFeedback = null
+        // Allow dragging from anywhere on the 3-button pill bar while keeping taps crisp
+        view.setOnTouchListener(createDragOrClickListener(onClick = null))
+        playContainer.setOnTouchListener(createDragOrClickListener {
+            overlayArrowsActive = !overlayArrowsActive
+            updateBoardVisibility()
+            updatePillVisualState()
+            if (overlayArrowsActive) {
                 triggerAnalysis()
             }
-        }
-        view.findViewById<ImageButton>(R.id.btnPillReset).setOnClickListener {
-            resetGame()
-        }
-        view.findViewById<ImageButton>(R.id.btnPillSettings).setOnClickListener {
+        })
+        btnSettings.setOnTouchListener(createDragOrClickListener {
             toggleSettingsModal()
-        }
-        view.findViewById<ImageButton>(R.id.btnPillClose).setOnClickListener {
+        })
+        btnClose.setOnTouchListener(createDragOrClickListener {
             stopSelf()
-        }
-
-        // Draggable pill bar via root & stats badge
-        val dragListener = createPillDragListener()
-        view.setOnTouchListener(dragListener)
-        tvPillStats?.setOnTouchListener(dragListener)
+        })
 
         try {
             windowManager.addView(view, params)
         } catch (_: Throwable) {
             stopSelf()
         }
-        updatePillButtonStates()
+        updatePillVisualState()
     }
 
-    private fun createPillDragListener(): View.OnTouchListener {
+    private fun createDragOrClickListener(onClick: (() -> Unit)?): View.OnTouchListener {
         return object : View.OnTouchListener {
             private var startX = 0
             private var startY = 0
@@ -392,12 +613,16 @@ class OverlayService : Service() {
                         touchX = event.rawX
                         touchY = event.rawY
                         moved = false
+                        v.isPressed = true
                         return true
                     }
                     MotionEvent.ACTION_MOVE -> {
                         val dx = (event.rawX - touchX).toInt()
                         val dy = (event.rawY - touchY).toInt()
-                        if (abs(dx) > 6 || abs(dy) > 6) moved = true
+                        if (abs(dx) > 8 || abs(dy) > 8) {
+                            moved = true
+                            v.isPressed = false
+                        }
                         if (moved) {
                             pp.x = (startX + dx).coerceAtLeast(0)
                             pp.y = (startY + dy).coerceAtLeast(0)
@@ -409,10 +634,17 @@ class OverlayService : Service() {
                         return true
                     }
                     MotionEvent.ACTION_UP -> {
+                        v.isPressed = false
                         if (moved) {
                             prefs.pillX = pp.x
                             prefs.pillY = pp.y
+                        } else {
+                            onClick?.invoke()
                         }
+                        return true
+                    }
+                    MotionEvent.ACTION_CANCEL -> {
+                        v.isPressed = false
                         return true
                     }
                 }
@@ -421,20 +653,47 @@ class OverlayService : Service() {
         }
     }
 
-    private fun updatePillButtonStates() {
-        val styleSuffix = if (prefs.playStyle != PlayStyle.DEFAULT) "·${prefs.playStyle.shortTag}" else ""
-        tvPillStats?.text = "${prefs.targetElo}·${prefs.targetAccuracy}%$styleSuffix"
+    private fun updatePillVisualState() {
+        val playIcon = ivPillPlay
+        if (playIcon != null) {
+            if (overlayArrowsActive) {
+                playIcon.setImageResource(R.drawable.ic_play)
+                playIcon.setColorFilter(Color.parseColor("#22C55E"))
+            } else {
+                playIcon.setImageResource(R.drawable.ic_pause)
+                playIcon.setColorFilter(Color.parseColor("#64748B"))
+            }
+        }
 
-        btnPillAlign?.setColorFilter(
-            if (currentMode == OverlayMode.ALIGN) Color.parseColor("#19E58F") else Color.parseColor("#F3F6FA")
-        )
+        val dot = viewPillStatusDot
+        if (dot != null) {
+            val dotColor = when {
+                !overlayArrowsActive -> Color.parseColor("#64748B")
+                isAutoReadLive() && autoBoardDetectedVisible -> Color.parseColor("#22C55E")
+                isAutoReadLive() -> Color.parseColor("#F59E0B")
+                else -> Color.parseColor("#38BDF8")
+            }
+            val bg = dot.background
+            if (bg is GradientDrawable) {
+                bg.setColor(dotColor)
+            } else {
+                dot.setBackgroundColor(dotColor)
+            }
+        }
+    }
 
-        if (currentMode == OverlayMode.PASS_THROUGH) {
-            btnPillTouchMode?.setImageResource(R.drawable.ic_passthrough)
-            btnPillTouchMode?.setColorFilter(Color.parseColor("#9BA4B5"))
-        } else {
-            btnPillTouchMode?.setImageResource(R.drawable.ic_touch)
-            btnPillTouchMode?.setColorFilter(Color.parseColor("#19E58F"))
+    private fun describeScreenReadStatus(): String {
+        return when {
+            isAutoReadLive() && autoBoardDetectedVisible ->
+                if (manualAlignLocked) "Auto-Read: Locked (custom align)" else "Auto-Read: Locked on board"
+            isAutoReadLive() ->
+                "Auto-Read: Scanning for board…"
+            prefs.autoReadScreen && !hasMediaProjectionGrant ->
+                "Auto-Read: Needs screen permission (tap Start in app)"
+            prefs.tapInputMode ->
+                "Manual Tap Mode (tap moves on board)"
+            else ->
+                "Manual Pass-Through Mode"
         }
     }
 
@@ -452,17 +711,62 @@ class OverlayService : Service() {
             themedContext = themedContext,
             prefs = prefs,
             engineNameProvider = { engine.activeEngineName },
+            screenReadStatusProvider = { describeScreenReadStatus() },
             onSettingsChanged = { reanalyze ->
                 applyPrefsToViews()
-                updatePillButtonStates()
                 if (reanalyze) {
                     triggerAnalysis()
                 } else {
                     refreshBoardView(analyzing = false)
                 }
             },
+            onAutoReadToggled = { enabled ->
+                if (enabled && !hasMediaProjectionGrant) {
+                    hideSettingsModal()
+                    Toast.makeText(
+                        this,
+                        "Opening app to grant Screen Capture permission…",
+                        Toast.LENGTH_SHORT
+                    ).show()
+                    val i = Intent(this, MainActivity::class.java).apply {
+                        flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP
+                        putExtra(MainActivity.EXTRA_REQUEST_AUTO_READ, true)
+                    }
+                    try {
+                        startActivity(i)
+                    } catch (_: Throwable) {
+                    }
+                } else if (!enabled) {
+                    stopScreenCapture()
+                    updateBoardVisibility()
+                    updatePillVisualState()
+                }
+            },
+            onTapInputToggled = { tapEnabled ->
+                setOverlayMode(if (tapEnabled) OverlayMode.TAP_MOVE else OverlayMode.PASS_THROUGH)
+            },
             onAlignClicked = { setOverlayMode(OverlayMode.ALIGN) },
+            onFlipClicked = {
+                prefs.playingAsWhite = !prefs.playingAsWhite
+                applyPrefsToViews()
+                refreshBoardView(analyzing = false)
+            },
+            onUndoClicked = {
+                if (board.undoLastMove() != null) {
+                    lastFeedback = null
+                    triggerAnalysis()
+                }
+            },
             onNewGameClicked = { resetGame() },
+            onRedetectClicked = {
+                manualAlignLocked = false
+                screenBoardReader?.lockedScreenRect = null
+                trackingSession.resetTracking()
+                autoBoardDetectedVisible = false
+                updateBoardVisibility()
+                updatePillVisualState()
+                Toast.makeText(this, "Scanning for board…", Toast.LENGTH_SHORT).show()
+            },
             onDismiss = { hideSettingsModal() }
         ).also { settingsController = it }
 
@@ -504,10 +808,11 @@ class OverlayService : Service() {
             showEvalBar = prefs.showEvalBar
             showBoardWarnings = prefs.boardWarnings
             showPinnedPieces = prefs.markPinnedPieces
+            showLineRisks = prefs.markLineRisks
             showPieceMarkers = prefs.showPieceMarkers
             showMoveFeedback = prefs.analyzeMyMoves
         }
-        updatePillButtonStates()
+        updatePillVisualState()
     }
 
     private fun handleUserMove(move: Move) {
@@ -537,6 +842,7 @@ class OverlayService : Service() {
         board.reset()
         lastAnalysis = null
         lastFeedback = null
+        trackingSession.resetTracking()
         triggerAnalysis()
     }
 
@@ -586,6 +892,7 @@ class OverlayService : Service() {
         val playerColor = if (prefs.playingAsWhite) Piece.WHITE else Piece.BLACK
         val pins = board.findPinnedSquares(Piece.WHITE) + board.findPinnedSquares(Piece.BLACK)
         val warnings = board.findBoardWarnings(playerColor)
+        val risks = board.findLineRisks(playerColor)
         val status = board.getGameStatus()
 
         boardView?.updateState(
@@ -595,12 +902,14 @@ class OverlayService : Service() {
             boardWarnings = warnings,
             feedback = lastFeedback,
             status = status,
-            analyzing = analyzing
+            analyzing = analyzing,
+            risks = risks
         )
     }
 
     override fun onDestroy() {
         isRunning = false
+        stopScreenCapture()
         analysisJob?.cancel()
         engine.close()
         serviceScope.cancel()
@@ -623,9 +932,12 @@ class OverlayService : Service() {
     }
 
     companion object {
+        const val ACTION_START_OVERLAY = "com.chesscoach.overlay.ACTION_START_OVERLAY"
         const val ACTION_STOP = "com.chesscoach.overlay.ACTION_STOP"
         const val ACTION_UPDATE_TARGET_APP = "com.chesscoach.overlay.ACTION_UPDATE_TARGET_APP"
         const val EXTRA_TARGET_PACKAGE = "extra_target_package"
+        const val EXTRA_PROJECTION_RESULT_CODE = "extra_projection_result_code"
+        const val EXTRA_PROJECTION_DATA = "extra_projection_data"
 
         private const val CHANNEL_ID = "chess_coach_overlay_channel"
         private const val NOTIFICATION_ID = 4107

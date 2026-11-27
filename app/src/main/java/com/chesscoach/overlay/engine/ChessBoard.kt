@@ -784,6 +784,71 @@ class ChessBoard {
         return warnings
     }
 
+    /**
+     * Detects enemy sliding-piece attack & x-ray line risks aimed at [forColor]'s King or Queen(s)
+     * with 0 or 1 intervening piece along a rank, file, or diagonal.
+     */
+    fun findLineRisks(forColor: Int): List<LineRisk> {
+        val risks = ArrayList<LineRisk>()
+        val enemy = -forColor
+        val targets = ArrayList<Int>(2)
+        val kSq = if (forColor == Piece.WHITE) whiteKingSq else blackKingSq
+        if (kSq in 0..63) targets.add(kSq)
+        for (sq in 0..63) {
+            val p = squares[sq]
+            if (Piece.colorOf(p) == forColor && Piece.typeOf(p) == Piece.QUEEN) {
+                targets.add(sq)
+            }
+        }
+
+        val allDr = intArrayOf(1, 1, -1, -1, 1, -1, 0, 0)
+        val allDf = intArrayOf(1, -1, 1, -1, 0, 0, 1, -1)
+
+        for (targetSq in targets) {
+            val tr = Squares.rankOf(targetSq)
+            val tf = Squares.fileOf(targetSq)
+            for (d in 0..7) {
+                val isDiag = d < 4
+                var cr = tr + allDr[d]
+                var cf = tf + allDf[d]
+                var blockerSq = -1
+                while (cr in 0..7 && cf in 0..7) {
+                    val sq = Squares.of(cf, cr)
+                    val p = squares[sq]
+                    if (p != Piece.EMPTY) {
+                        if (Piece.colorOf(p) == enemy) {
+                            val pType = Piece.typeOf(p)
+                            val isSlider = if (isDiag) {
+                                pType == Piece.BISHOP || pType == Piece.QUEEN
+                            } else {
+                                pType == Piece.ROOK || pType == Piece.QUEEN
+                            }
+                            if (isSlider) {
+                                risks.add(
+                                    LineRisk(
+                                        attackerSquare = sq,
+                                        targetSquare = targetSq,
+                                        blockerSquare = blockerSq,
+                                        isDirectAttack = (blockerSq == -1)
+                                    )
+                                )
+                                break
+                            }
+                        }
+                        if (blockerSq == -1) {
+                            blockerSq = sq
+                        } else {
+                            break
+                        }
+                    }
+                    cr += allDr[d]
+                    cf += allDf[d]
+                }
+            }
+        }
+        return risks
+    }
+
     fun getGameStatus(): GameStatus {
         val legal = generateLegalMoves()
         if (legal.isEmpty()) {

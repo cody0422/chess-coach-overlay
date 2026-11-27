@@ -23,6 +23,28 @@ class OverlayPrefs(context: Context) {
     private val prefs: SharedPreferences =
         context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
 
+    init {
+        migrateIfNeeded()
+    }
+
+    private fun migrateIfNeeded() {
+        val schema = prefs.getInt(KEY_SCHEMA_VERSION, 1)
+        if (schema < CURRENT_SCHEMA_VERSION) {
+            // Upgrade from v1.0.0 cleanly to uncluttered v2.0.0 defaults while preserving
+            // user's Elo, Accuracy, Depth, Play Style, and chosen chess app.
+            prefs.edit()
+                .putBoolean(KEY_AUTO_READ_SCREEN, true)
+                .putBoolean(KEY_SHOW_MULTI_ARROWS, false)
+                .putBoolean(KEY_SHOW_EVAL_BAR, false)
+                .putBoolean(KEY_MARK_PINNED, false)
+                .putBoolean(KEY_MARK_LINE_RISKS, false)
+                .putBoolean(KEY_SHOW_PIECE_MARKERS, false)
+                .putBoolean(KEY_TAP_INPUT_MODE, false)
+                .putInt(KEY_SCHEMA_VERSION, CURRENT_SCHEMA_VERSION)
+                .apply()
+        }
+    }
+
     var targetElo: Int
         get() = prefs.getInt(KEY_TARGET_ELO, EloAccuracyHelper.DEFAULT_ELO)
             .coerceIn(EloAccuracyHelper.MIN_ELO, EloAccuracyHelper.MAX_ELO)
@@ -53,12 +75,20 @@ class OverlayPrefs(context: Context) {
             ).apply()
         }
 
+    var autoReadScreen: Boolean
+        get() = prefs.getBoolean(KEY_AUTO_READ_SCREEN, true)
+        set(value) = prefs.edit().putBoolean(KEY_AUTO_READ_SCREEN, value).apply()
+
+    var tapInputMode: Boolean
+        get() = prefs.getBoolean(KEY_TAP_INPUT_MODE, false)
+        set(value) = prefs.edit().putBoolean(KEY_TAP_INPUT_MODE, value).apply()
+
     var showArrows: Boolean
         get() = prefs.getBoolean(KEY_SHOW_ARROWS, true)
         set(value) = prefs.edit().putBoolean(KEY_SHOW_ARROWS, value).apply()
 
     var showMultiArrows: Boolean
-        get() = prefs.getBoolean(KEY_SHOW_MULTI_ARROWS, true)
+        get() = prefs.getBoolean(KEY_SHOW_MULTI_ARROWS, false)
         set(value) = prefs.edit().putBoolean(KEY_SHOW_MULTI_ARROWS, value).apply()
 
     var analyzeMyMoves: Boolean
@@ -70,15 +100,19 @@ class OverlayPrefs(context: Context) {
         set(value) = prefs.edit().putBoolean(KEY_BOARD_WARNINGS, value).apply()
 
     var showEvalBar: Boolean
-        get() = prefs.getBoolean(KEY_SHOW_EVAL_BAR, true)
+        get() = prefs.getBoolean(KEY_SHOW_EVAL_BAR, false)
         set(value) = prefs.edit().putBoolean(KEY_SHOW_EVAL_BAR, value).apply()
 
     var markPinnedPieces: Boolean
-        get() = prefs.getBoolean(KEY_MARK_PINNED, true)
+        get() = prefs.getBoolean(KEY_MARK_PINNED, false)
         set(value) = prefs.edit().putBoolean(KEY_MARK_PINNED, value).apply()
 
+    var markLineRisks: Boolean
+        get() = prefs.getBoolean(KEY_MARK_LINE_RISKS, false)
+        set(value) = prefs.edit().putBoolean(KEY_MARK_LINE_RISKS, value).apply()
+
     var showPieceMarkers: Boolean
-        get() = prefs.getBoolean(KEY_SHOW_PIECE_MARKERS, true)
+        get() = prefs.getBoolean(KEY_SHOW_PIECE_MARKERS, false)
         set(value) = prefs.edit().putBoolean(KEY_SHOW_PIECE_MARKERS, value).apply()
 
     var playStyle: PlayStyle
@@ -140,28 +174,34 @@ class OverlayPrefs(context: Context) {
 
     companion object {
         private const val PREFS_NAME = "chess_coach_overlay_prefs"
+        private const val CURRENT_SCHEMA_VERSION = 2
+        private const val KEY_SCHEMA_VERSION = "prefs_schema_version"
+
         private const val KEY_TARGET_ELO = "target_elo"
         private const val KEY_TARGET_ACCURACY = "target_accuracy"
         private const val KEY_SEARCH_DEPTH = "search_depth"
+        private const val KEY_AUTO_READ_SCREEN = "auto_read_screen"
+        private const val KEY_TAP_INPUT_MODE = "tap_input_mode"
         private const val KEY_SHOW_ARROWS = "show_arrows"
         private const val KEY_SHOW_MULTI_ARROWS = "show_multi_arrows"
         private const val KEY_ANALYZE_MY_MOVES = "analyze_my_moves"
         private const val KEY_BOARD_WARNINGS = "board_warnings"
         private const val KEY_SHOW_EVAL_BAR = "show_eval_bar"
-        private const val KEY_MARK_PINNED = "mark_pinned_pieces"
+        private const val KEY_MARK_PINNED = "mark_pinned"
+        private const val KEY_MARK_LINE_RISKS = "mark_line_risks"
         private const val KEY_SHOW_PIECE_MARKERS = "show_piece_markers"
         private const val KEY_PLAY_STYLE = "play_style"
         private const val KEY_PLAYING_AS_WHITE = "playing_as_white"
-        private const val KEY_SELECTED_APP_PKG = "selected_app_pkg"
+        private const val KEY_SELECTED_APP_PKG = "selected_app_package"
         private const val KEY_SELECTED_APP_LABEL = "selected_app_label"
         private const val KEY_PILL_X = "pill_x"
         private const val KEY_PILL_Y = "pill_y"
 
-        val PRESET_APPS = listOf(
-            PresetChessApp("Chess.com", "com.chess", "Play & Learn Chess"),
-            PresetChessApp("Lichess", "org.lichess.mobileapp", "Free Open-Source Chess"),
-            PresetChessApp("Chess · Splend", "com.splendapps.chess", "Offline & Online Chess"),
-            PresetChessApp("Chess Free", "uk.co.aifactory.chessfree", "AI Factory Offline Chess")
+        val PRESET_APPS: List<PresetChessApp> = listOf(
+            PresetChessApp("Chess.com", "com.chess", "Chess.com official app"),
+            PresetChessApp("Lichess", "org.lichess.mobileapp", "Lichess mobile"),
+            PresetChessApp("Chess · Splend", "com.splendapps.chess", "Splend Apps Chess"),
+            PresetChessApp("Chess Free", "uk.co.aifactory.chessfree", "AI Factory Chess Free")
         )
     }
 }
