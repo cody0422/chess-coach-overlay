@@ -1,6 +1,7 @@
 package com.chesscoach.overlay.vision
 
 import android.accessibilityservice.AccessibilityService
+import android.accessibilityservice.AccessibilityServiceInfo
 import android.content.Context
 import android.content.Intent
 import android.graphics.Bitmap
@@ -10,17 +11,17 @@ import android.os.HandlerThread
 import android.os.Looper
 import android.os.SystemClock
 import android.util.DisplayMetrics
+import android.util.Log
 import android.view.Display
 import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
 import androidx.annotation.RequiresApi
 import com.chesscoach.overlay.engine.Move
+import java.util.concurrent.CopyOnWriteArraySet
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
-import java.util.concurrent.CopyOnWriteArraySet
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.max
-import kotlin.math.min
 
 /**
  * Silent AccessibilityService screen reader (Android 11+ / API 30+).
@@ -30,6 +31,7 @@ import kotlin.math.min
  */
 class ChessAccessibilityService : AccessibilityService() {
 
+    private val watchdogHandler = Handler(Looper.getMainLooper())
     private var captureExecutor: ExecutorService? = null
     private val captureInFlight = AtomicBoolean(false)
 
@@ -43,6 +45,18 @@ class ChessAccessibilityService : AccessibilityService() {
 
     override fun onServiceConnected() {
         super.onServiceConnected()
+        val info = serviceInfo
+        val caps = info?.capabilities ?: 0
+        val canScreenshot = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            (caps and AccessibilityServiceInfo.CAPABILITY_CAN_TAKE_SCREENSHOT) != 0
+        } else {
+            false
+        }
+        if (canScreenshot) {
+            Log.i(TAG, "onServiceConnected: capabilities=0x${caps.toString(16)} (canTakeScreenshot=true)")
+        } else {
+            Log.w(TAG, "onServiceConnected: capabilities=0x${caps.toString(16)} (canTakeScreenshot=false, info=$info)")
+        }
         instance = this
         notifyConnectionChanged(true)
     }
@@ -82,6 +96,7 @@ class ChessAccessibilityService : AccessibilityService() {
     }
 
     private fun shutdownExecutor() {
+        watchdogHandler.removeCallbacksAndMessages(null)
         try {
             captureExecutor?.shutdownNow()
         } catch (_: Throwable) {
@@ -119,12 +134,30 @@ class ChessAccessibilityService : AccessibilityService() {
             return false
         }
 
+        val settled = AtomicBoolean(false)
+        val watchdog = Runnable {
+            if (settled.compareAndSet(false, true)) {
+                captureInFlight.set(false)
+                Log.w(TAG, "takeScreenshot watchdog fired after ${CAPTURE_WATCHDOG_MS}ms; resetting captureInFlight")
+                onError(-2, "Screenshot callback timed out")
+            }
+        }
+        watchdogHandler.postDelayed(watchdog, CAPTURE_WATCHDOG_MS)
+
         return try {
             takeScreenshot(
                 Display.DEFAULT_DISPLAY,
                 executor,
                 object : TakeScreenshotCallback {
                     override fun onSuccess(screenshot: ScreenshotResult) {
+                        watchdogHandler.removeCallbacks(watchdog)
+                        if (!settled.compareAndSet(false, true)) {
+                            try {
+                                screenshot.hardwareBuffer.close()
+                            } catch (_: Throwable) {
+                            }
+                            return
+                        }
                         try {
                             processScreenshotResult(screenshot, onFrame, onError)
                         } catch (t: Throwable) {
@@ -135,6 +168,8 @@ class ChessAccessibilityService : AccessibilityService() {
                     }
 
                     override fun onFailure(errorCode: Int) {
+                        watchdogHandler.removeCallbacks(watchdog)
+                        if (!settled.compareAndSet(false, true)) return
                         captureInFlight.set(false)
                         if (errorCode == ERROR_TAKE_SCREENSHOT_INTERVAL_TIME_SHORT) {
                             onRateLimited()
@@ -146,8 +181,11 @@ class ChessAccessibilityService : AccessibilityService() {
             )
             true
         } catch (t: Throwable) {
-            captureInFlight.set(false)
-            onError(-1, "takeScreenshot: ${t.javaClass.simpleName}: ${t.message ?: ""}")
+            watchdogHandler.removeCallbacks(watchdog)
+            if (settled.compareAndSet(false, true)) {
+                captureInFlight.set(false)
+                onError(-1, "takeScreenshot: ${t.javaClass.simpleName}: ${t.message ?: ""}")
+            }
             false
         }
     }
@@ -249,7 +287,9 @@ class ChessAccessibilityService : AccessibilityService() {
     }
 
     companion object {
+        private const val TAG = "ChessA11y"
         private const val TARGET_CAPTURE_WIDTH = 540
+        private const val CAPTURE_WATCHDOG_MS = 3000L
 
         @Volatile
         var instance: ChessAccessibilityService? = null
@@ -286,15 +326,17 @@ class ChessAccessibilityService : AccessibilityService() {
 /**
  * Event-driven + heartbeat screen reader backed by [ChessAccessibilityService.takeScreenshot].
  *
- * - Fires an immediate settled read (~140ms after a window/content change) whenever a chess piece
- *   moves on screen, respecting Android's ~1s Accessibility screenshot interval cleanly.
+ * - Fires a settled read (~140ms after a window/content change) whenever a chess piece
+ *   moves on screen without starving on rapid clock ticks, respecting Android's ~1s
+ *   Accessibility screenshot interval cleanly.
  * - Runs a 1100ms background heartbeat so initial board lock and idle updates never starve.
  * - Produces identical [FrameAnalysis] objects to [ScreenBoardReader], scaled to physical screen coords.
  */
 class AccessibilityBoardReader(
     private val context: Context,
     private val onFrameAnalyzed: (FrameAnalysis) -> Unit,
-    private val onDisconnected: () -> Unit
+    private val onDisconnected: () -> Unit,
+    private val onCaptureError: (String) -> Unit = {}
 ) {
     private val mainHandler = Handler(Looper.getMainLooper())
     private val running = AtomicBoolean(false)
@@ -308,6 +350,7 @@ class AccessibilityBoardReader(
     private var framesCaptured: Long = 0L
     private var lastCaptureAttemptMs: Long = 0L
     private var nextAllowedCaptureMs: Long = 0L
+    private var eventCapturePending: Boolean = false
 
     @Volatile
     var lockedScreenRect: PixelRect? = null
@@ -326,6 +369,7 @@ class AccessibilityBoardReader(
         get() = running.get() && ChessAccessibilityService.isConnected()
 
     private val eventCaptureRunnable = Runnable {
+        eventCapturePending = false
         if (!running.get()) return@Runnable
         requestCaptureNow()
     }
@@ -358,6 +402,7 @@ class AccessibilityBoardReader(
         framesCaptured = 0L
         lastCaptureAttemptMs = 0L
         nextAllowedCaptureMs = 0L
+        eventCapturePending = false
 
         val thread = HandlerThread("AccessibilityBoardReader").apply { start() }
         val handler = Handler(thread.looper)
@@ -370,7 +415,11 @@ class AccessibilityBoardReader(
         }
         ChessAccessibilityService.addConnectionListener(connectionListener)
 
-        handler.postDelayed(eventCaptureRunnable, INITIAL_CAPTURE_DELAY_MS)
+        handler.post {
+            if (!running.get()) return@post
+            eventCapturePending = true
+            handler.postDelayed(eventCaptureRunnable, INITIAL_CAPTURE_DELAY_MS)
+        }
         handler.postDelayed(heartbeatRunnable, HEARTBEAT_INTERVAL_MS)
         return true
     }
@@ -385,6 +434,7 @@ class AccessibilityBoardReader(
 
     fun stop() {
         running.set(false)
+        eventCapturePending = false
         ChessAccessibilityService.onScreenContentChanged = null
         ChessAccessibilityService.removeConnectionListener(connectionListener)
         bgHandler?.removeCallbacks(eventCaptureRunnable)
@@ -406,10 +456,13 @@ class AccessibilityBoardReader(
         val handler = bgHandler ?: return
         handler.post {
             if (!running.get()) return@post
+            // Do NOT cancel & re-post an already-pending event capture: ticking chess clocks
+            // fire TYPE_WINDOW_CONTENT_CHANGED every 50-100ms and would starve it indefinitely.
+            if (eventCapturePending) return@post
             val now = SystemClock.uptimeMillis()
             val earliest = max(lastCaptureAttemptMs + MIN_CAPTURE_INTERVAL_MS, nextAllowedCaptureMs)
             val delay = max(EVENT_SETTLE_DELAY_MS, earliest - now)
-            handler.removeCallbacks(eventCaptureRunnable)
+            eventCapturePending = true
             handler.postDelayed(eventCaptureRunnable, delay)
         }
     }
@@ -427,8 +480,11 @@ class AccessibilityBoardReader(
         val now = SystemClock.uptimeMillis()
         if (now < nextAllowedCaptureMs) {
             val wait = (nextAllowedCaptureMs - now).coerceAtLeast(100L)
-            bgHandler?.removeCallbacks(eventCaptureRunnable)
-            bgHandler?.postDelayed(eventCaptureRunnable, wait)
+            bgHandler?.let { handler ->
+                handler.removeCallbacks(eventCaptureRunnable)
+                eventCapturePending = true
+                handler.postDelayed(eventCaptureRunnable, wait)
+            }
             return
         }
 
@@ -447,13 +503,21 @@ class AccessibilityBoardReader(
                     if (!running.get()) return@post
                     // Back off gently without surfacing an error
                     nextAllowedCaptureMs = SystemClock.uptimeMillis() + RATE_LIMIT_BACKOFF_MS
-                    bgHandler?.removeCallbacks(eventCaptureRunnable)
-                    bgHandler?.postDelayed(eventCaptureRunnable, RATE_LIMIT_BACKOFF_MS)
+                    bgHandler?.let { handler ->
+                        handler.removeCallbacks(eventCaptureRunnable)
+                        eventCapturePending = true
+                        handler.postDelayed(eventCaptureRunnable, RATE_LIMIT_BACKOFF_MS)
+                    }
                 }
             },
             onError = { _, msg ->
                 if (!running.get()) return@captureFrame
                 lastError = msg
+                mainHandler.post {
+                    if (running.get()) {
+                        onCaptureError(msg)
+                    }
+                }
             }
         )
     }

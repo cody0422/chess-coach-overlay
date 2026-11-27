@@ -370,6 +370,10 @@ class OverlayService : Service() {
                 updateBoardVisibility()
                 updatePillVisualState()
                 settingsController?.syncFromPrefs()
+            },
+            onCaptureError = { msg ->
+                lastCaptureError = msg
+                settingsController?.syncFromPrefs()
             }
         )
         readerRef = reader
@@ -492,6 +496,9 @@ class OverlayService : Service() {
     private fun handleScreenFrame(analysis: FrameAnalysis) {
         if (!isAutoReadLive()) return
 
+        if (lastCaptureError != null) {
+            lastCaptureError = null
+        }
         lastFramesCaptured = analysis.framesCaptured
 
         // Preserve pre-Settings detection telemetry & luma while the dark Settings modal covers the board

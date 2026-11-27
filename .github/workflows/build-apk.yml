@@ -92,14 +92,14 @@ jobs:
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v2.4.0
-          name: ChessCoachOverlay v2.4.0
+          tag_name: v2.4.1
+          name: ChessCoachOverlay v2.4.1
           body: |
-            ## ChessCoachOverlay v2.4.0
-            - **Your Pieces Only (`My Turn Only` on by default):** Arrows vanish smoothly on your opponent's turn and pop back the instant they move — works automatically whether you're playing White or Black (configurable in Settings)
-            - **Zero Red Box in Status Bar (No-Red-Box Accessibility Mode):** Silent `AccessibilityService.takeScreenshot()` board reading removes Android's red screen-cast status-bar icon and removes the "Start now" prompt every launch, with event-driven instant move detection, 1-frame move confirmation, and a 1-tap Samsung Android 15 setup card (plus optional Fast Cast Mode fallback in Settings)
-            - **Live-Streaming Stockfish 19 (~50ms First Arrow) + 60fps Animated Arrow:** Streams Stockfish 19's first best move live as it searches instead of waiting for full search completion, paired with silky 60fps glide/fade animations on the sleek black arrow
-            - **Built on v2.3.0:** Official **Stockfish 19 (`sf_19` ARM64 NNUE)**, 64/64 Ocean/textured theme board reader, black-arrow self-masking, automatic White/Black orientation detection, and fixed pill Play/Pause icon
+            ## ChessCoachOverlay v2.4.1
+            - **Fixed No-Red-Box Accessibility Screenshots (`AndroidManifest.xml`):** Corrected `AccessibilityService` meta-data tag (`android.accessibilityservice`) so Android loads `@xml/accessibility_service_config` and grants `canTakeScreenshot` cleanly — eliminating the stuck `"Waiting for screen frames..."` state
+            - **Clock-Safe Event Debounce + Watchdog:** Prevents Chess.com's ticking clock events from starving Accessibility board reads and adds a 3-second watchdog guard on in-flight screenshots
+            - **Live Capture Error Telemetry:** Surfaces any Accessibility screenshot error immediately in Settings instead of hiding it behind `"Waiting for screen frames..."`
+            - **Built on v2.4.0:** Official **Stockfish 19 (`sf_19` ARM64 NNUE)** with live ~50ms move streaming, 60fps animated sleek black arrow, `My Turn Only` (your pieces only), 64/64 Ocean board reader, and automatic White/Black orientation detection
           files: |
             ChessCoachOverlay.apk
           make_latest: true

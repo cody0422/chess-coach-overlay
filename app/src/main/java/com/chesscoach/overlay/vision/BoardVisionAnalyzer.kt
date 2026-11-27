@@ -1395,6 +1395,8 @@ object AutoReadStatusFormatter {
                 val side = if (playingAsWhite) "White" else "Black"
                 "$prefix: Locked ($side · move $fullMoveNumber)"
             }
+            autoReadLive && framesCaptured == 0L && !lastCaptureError.isNullOrBlank() ->
+                "$prefix error: ${lastCaptureError.take(90)}"
             autoReadLive && framesCaptured == 0L ->
                 "$prefix: Waiting for screen frames..."
             autoReadLive && frameMaxLum in 0..11 ->
