@@ -800,6 +800,7 @@ object BoardVisionAnalyzer {
         val sqH = rect.height / 8f
         val localBg = IntArray(3)
         val fgLums = IntArray(144)
+        val coreLums = IntArray(36)
 
         val arrowMask = if (activeArrow != null) {
             buildArrowMaskGeometry(rect, sqW, sqH, activeArrow, activeArrowPlayingAsWhite)
@@ -811,8 +812,10 @@ object BoardVisionAnalyzer {
             detection.evenRgb.r, detection.evenRgb.g, detection.evenRgb.b,
             detection.oddRgb.r, detection.oddRgb.g, detection.oddRgb.b
         )
-        // Scale foreground distance threshold cleanly across low-contrast slate & textured Ocean themes
-        val fgDistThreshold = (boardSep * 0.28f).coerceIn(22f, 44f)
+        // Dark textured squares (e.g. Ocean blue waves) use a wider threshold than light squares,
+        // while light squares stay sensitive enough to keep white piece interiors visible.
+        val darkFgThreshold = (boardSep * 0.28f).coerceIn(20f, 40f)
+        val lightFgThreshold = (boardSep * 0.14f).coerceIn(16f, 19f)
 
         for (r in 0..7) {
             for (c in 0..7) {
@@ -832,10 +835,13 @@ object BoardVisionAnalyzer {
                 val bgR = if (useLocalBg) localBg[0] else parityBg.r
                 val bgG = if (useLocalBg) localBg[1] else parityBg.g
                 val bgB = if (useLocalBg) localBg[2] else parityBg.b
+                val bgLum = (299 * bgR + 587 * bgG + 114 * bgB) / 1000
+                val fgDistThreshold = if (bgLum < 175) darkFgThreshold else lightFgThreshold
 
                 val samples = 12
                 var validSamples = 0
                 var fgCount = 0
+                var coreCount = 0
                 var fgLumSum = 0L
                 var brightFg = 0
                 var darkFg = 0
@@ -876,9 +882,13 @@ object BoardVisionAnalyzer {
                         }
                         prevPx = argb
 
+                        val lum = (299 * pr + 587 * pg + 114 * pb) / 1000
+                        if (sx in 3..8 && sy in 3..8 && coreCount < coreLums.size) {
+                            coreLums[coreCount++] = lum
+                        }
+
                         val dist = colorDist(pr, pg, pb, bgR, bgG, bgB)
                         if (dist > fgDistThreshold) {
-                            val lum = (299 * pr + 587 * pg + 114 * pb) / 1000
                             fgLums[fgCount++] = lum
                             fgLumSum += lum
                             if (lum >= 170) brightFg++
@@ -902,9 +912,18 @@ object BoardVisionAnalyzer {
                     val brightFrac = brightFg.toFloat() / fgCount.toFloat()
                     val darkFrac = darkFg.toFloat() / fgCount.toFloat()
 
-                    val isWhite = (p75Lum >= 170f && darkFrac < 0.45f) ||
+                    var isWhite = (p75Lum >= 170f && darkFrac < 0.45f) ||
                         (meanLum >= 145f) ||
                         (brightFrac >= 0.35f && darkFrac < 0.45f)
+
+                    // On near-white light squares, a pure-white piece's interior can stay close to bg;
+                    // inspect the inner core median luminance so it is never misread as BLACK.
+                    if (!isWhite && bgLum >= 195 && coreCount >= 8) {
+                        coreLums.sort(0, coreCount)
+                        if (coreLums[coreCount / 2] >= 215) {
+                            isWhite = true
+                        }
+                    }
 
                     grid[r * 8 + c] = if (isWhite) SquareOccupancy.WHITE else SquareOccupancy.BLACK
                 } else {
