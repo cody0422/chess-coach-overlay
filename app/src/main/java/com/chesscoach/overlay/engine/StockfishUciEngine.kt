@@ -7,7 +7,6 @@ import java.io.File
 import java.io.InputStreamReader
 import java.io.OutputStreamWriter
 import java.util.concurrent.atomic.AtomicBoolean
-import kotlin.math.max
 import kotlin.random.Random
 
 /**
@@ -47,17 +46,71 @@ data class ParsedUciInfo(
     val scoredMove: ScoredMove
 )
 
+data class SearchBudget(
+    val sfDepth: Int,
+    val moveTimeMs: Long
+)
+
 /**
- * Pure-Kotlin UCI `info` parser & live-PV interim streaming policy.
+ * Pure-Kotlin UCI `info` parser, MultiPV / search budget planner, and live-PV interim streaming policy.
  * Kept Android-free so every branch is directly covered by JVM unit tests.
  */
 object StockfishUciParser {
-    const val MIN_INTERIM_DEPTH = 7
-    const val MIN_INTERIM_INTERVAL_MS = 70L
+    const val MIN_INTERIM_DEPTH = 5
+    const val MIN_INTERIM_INTERVAL_MS = 35L
+
+    /**
+     * Avoid forcing MultiPV=5 when only a single arrow is displayed:
+     * - Single arrow (`requestedMultiPv == 1`) with >=95% accuracy & Default style -> MultiPV = 1 (~3-5x faster!)
+     * - Single arrow with human/accuracy variation -> MultiPV = 2 (never 5!)
+     * - Multi-arrows (`requestedMultiPv > 1`) -> honor requestedMultiPv (clamped 1..5).
+     */
+    fun resolveActualMultiPv(
+        requestedMultiPv: Int,
+        clampedAcc: Int,
+        playStyle: PlayStyle,
+        legalMoveCount: Int
+    ): Int {
+        val req = requestedMultiPv.coerceIn(1, 5)
+        val wantPv = when {
+            req > 1 -> req
+            clampedAcc >= 95 && playStyle == PlayStyle.DEFAULT -> 1
+            else -> 2
+        }
+        return wantPv.coerceAtMost(legalMoveCount).coerceAtLeast(1)
+    }
+
+    /**
+     * Maps Depth slider 1..8 cleanly from instant sub-second (<150ms..750ms) up to 5s on Depth 8.
+     */
+    fun searchBudgetFor(sliderDepth: Int, clampedElo: Int): SearchBudget {
+        val d = sliderDepth.coerceIn(EloAccuracyHelper.MIN_DEPTH, EloAccuracyHelper.MAX_DEPTH)
+        val base = when (d) {
+            1 -> SearchBudget(sfDepth = 8, moveTimeMs = 150L)
+            2 -> SearchBudget(sfDepth = 10, moveTimeMs = 250L)
+            3 -> SearchBudget(sfDepth = 12, moveTimeMs = 450L)
+            4 -> SearchBudget(sfDepth = 14, moveTimeMs = 750L)
+            5 -> SearchBudget(sfDepth = 16, moveTimeMs = 1400L)
+            6 -> SearchBudget(sfDepth = 18, moveTimeMs = 2400L)
+            7 -> SearchBudget(sfDepth = 20, moveTimeMs = 3600L)
+            else -> SearchBudget(sfDepth = 24, moveTimeMs = 5000L)
+        }
+        return when {
+            clampedElo < 900 -> SearchBudget(
+                sfDepth = d.coerceIn(1, 4),
+                moveTimeMs = base.moveTimeMs.coerceAtMost(250L)
+            )
+            clampedElo < 1320 -> SearchBudget(
+                sfDepth = (d + 1).coerceIn(2, 6),
+                moveTimeMs = base.moveTimeMs.coerceAtMost(400L)
+            )
+            else -> base
+        }
+    }
 
     fun parseInfoLine(line: String, legalMoves: List<Move>): ParsedUciInfo? {
         if (!line.startsWith("info ") || !line.contains(" pv ")) return null
-        val tokens = line.trim().split(Regex("\\s+"))
+        val tokens = line.trim().split(Regex("\s+"))
         var depth = 0
         var multiPv = 1
         var nodes = 0L
@@ -201,8 +254,8 @@ object StockfishUciParser {
 
 /**
  * Wraps the optional bundled native Stockfish 19 UCI binary (`libstockfish.so` in nativeLibraryDir)
- * with live PV streaming (~50ms first arrow) and seamlessly falls back to the pure-Kotlin
- * [ChessEngine] whenever the binary is absent or encounters any runtime error.
+ * with live PV streaming (~50-200ms first arrow), UCI option caching, and seamlessly falls back
+ * to the pure-Kotlin [ChessEngine] whenever the binary is absent or encounters any runtime error.
  */
 class StockfishUciEngine(private val context: Context) {
 
@@ -216,6 +269,12 @@ class StockfishUciEngine(private val context: Context) {
     private var writer: BufferedWriter? = null
     private var reader: BufferedReader? = null
 
+    // Cached UCI options so we only send setoption + isready when settings actually change
+    private var lastMultiPv: Int = -1
+    private var lastLimitStrength: Boolean? = null
+    private var lastUciElo: Int = -1
+    private var lastSkillLevel: Int = -1
+
     @Volatile
     private var stockfishFailed = false
 
@@ -224,6 +283,10 @@ class StockfishUciEngine(private val context: Context) {
 
     @Volatile
     var activeEngineName: String = "Local Engine"
+        private set
+
+    @Volatile
+    var lastStartupError: String? = null
         private set
 
     fun hasBinary(): Boolean {
@@ -239,9 +302,17 @@ class StockfishUciEngine(private val context: Context) {
         }
     }
 
+    private fun resetCachedOptionsLocked() {
+        lastMultiPv = -1
+        lastLimitStrength = null
+        lastUciElo = -1
+        lastSkillLevel = -1
+    }
+
     private fun startStockfishLocked(): Boolean {
         val sfFile = File(context.applicationInfo.nativeLibraryDir, STOCKFISH_LIB_NAME)
         if (!sfFile.exists() || sfFile.length() == 0L) {
+            lastStartupError = "Stockfish binary missing"
             activeEngineName = "Local Engine"
             return false
         }
@@ -258,34 +329,41 @@ class StockfishUciEngine(private val context: Context) {
             process = proc
             writer = w
             reader = r
+            resetCachedOptionsLocked()
 
             sendLineLocked("uci")
-            val gotUciOk = waitForTokenLocked("uciok", 4000L)
+            val gotUciOk = waitForTokenLocked("uciok", COLD_START_TIMEOUT_MS)
             if (!gotUciOk) {
                 destroyProcessLocked()
                 stockfishFailed = true
+                lastStartupError = "uciok timeout (${COLD_START_TIMEOUT_MS}ms)"
                 activeEngineName = "Local Engine"
                 return false
             }
 
-            sendLineLocked("setoption name Threads value 2")
-            sendLineLocked("setoption name Hash value 32")
-            sendLineLocked("setoption name MultiPV value 3")
+            val threads = Runtime.getRuntime().availableProcessors().coerceIn(2, 4)
+            sendLineLocked("setoption name Threads value $threads")
+            sendLineLocked("setoption name Hash value 64")
+            sendLineLocked("setoption name MultiPV value 1")
+            lastMultiPv = 1
             sendLineLocked("isready")
-            val ready = waitForTokenLocked("readyok", 4000L)
+            val ready = waitForTokenLocked("readyok", COLD_START_TIMEOUT_MS)
             if (!ready) {
                 destroyProcessLocked()
                 stockfishFailed = true
+                lastStartupError = "readyok timeout (${COLD_START_TIMEOUT_MS}ms)"
                 activeEngineName = "Local Engine"
                 return false
             }
 
             initialized = true
+            lastStartupError = null
             activeEngineName = "Stockfish 19"
             true
-        } catch (_: Throwable) {
+        } catch (t: Throwable) {
             destroyProcessLocked()
             stockfishFailed = true
+            lastStartupError = "${t.javaClass.simpleName}: ${t.message ?: ""}".take(80)
             activeEngineName = "Local Engine"
             false
         }
@@ -297,7 +375,8 @@ class StockfishUciEngine(private val context: Context) {
         if (searching.get()) {
             try {
                 writer?.let {
-                    it.write("stop\n")
+                    it.write("stop
+")
                     it.flush()
                 }
             } catch (_: Throwable) {
@@ -312,7 +391,7 @@ class StockfishUciEngine(private val context: Context) {
         searchDepth: Int = EloAccuracyHelper.DEFAULT_DEPTH,
         targetAccuracy: Int = EloAccuracyHelper.DEFAULT_ACCURACY,
         playStyle: PlayStyle = PlayStyle.DEFAULT,
-        multiPv: Int = 3,
+        multiPv: Int = 1,
         rng: Random = Random.Default,
         onInterimResult: ((AnalysisResult) -> Unit)? = null
     ): AnalysisResult {
@@ -371,54 +450,82 @@ class StockfishUciEngine(private val context: Context) {
             val clampedDepth = searchDepth.coerceIn(EloAccuracyHelper.MIN_DEPTH, EloAccuracyHelper.MAX_DEPTH)
             val clampedAcc = targetAccuracy.coerceIn(EloAccuracyHelper.MIN_ACCURACY, EloAccuracyHelper.MAX_ACCURACY)
 
-            val wantPv = if (clampedAcc < 100 || playStyle != PlayStyle.DEFAULT) max(multiPv, 5) else multiPv.coerceIn(1, 5)
-            val actualPv = wantPv.coerceAtMost(legalMoves.size).coerceAtLeast(1)
+            val actualPv = StockfishUciParser.resolveActualMultiPv(
+                requestedMultiPv = multiPv,
+                clampedAcc = clampedAcc,
+                playStyle = playStyle,
+                legalMoveCount = legalMoves.size
+            )
 
             return try {
                 cancelRequested.set(false)
                 searching.set(true)
 
-                sendLineLocked("setoption name MultiPV value $actualPv")
+                var optionsChanged = false
 
-                // Configure Stockfish 19 strength for 400..4000 Elo
+                if (lastMultiPv != actualPv) {
+                    sendLineLocked("setoption name MultiPV value $actualPv")
+                    lastMultiPv = actualPv
+                    optionsChanged = true
+                }
+
+                // Configure Stockfish 19 strength for 400..4000 Elo (only emit when changed)
                 when {
                     clampedElo > 3190 -> {
-                        sendLineLocked("setoption name UCI_LimitStrength value false")
-                        sendLineLocked("setoption name Skill Level value 20")
+                        if (lastLimitStrength != false) {
+                            sendLineLocked("setoption name UCI_LimitStrength value false")
+                            lastLimitStrength = false
+                            optionsChanged = true
+                        }
+                        if (lastSkillLevel != 20) {
+                            sendLineLocked("setoption name Skill Level value 20")
+                            lastSkillLevel = 20
+                            optionsChanged = true
+                        }
+                        lastUciElo = -1
                     }
                     clampedElo >= 1320 -> {
-                        sendLineLocked("setoption name UCI_LimitStrength value true")
-                        sendLineLocked("setoption name UCI_Elo value $clampedElo")
+                        if (lastLimitStrength != true) {
+                            sendLineLocked("setoption name UCI_LimitStrength value true")
+                            lastLimitStrength = true
+                            optionsChanged = true
+                        }
+                        if (lastUciElo != clampedElo) {
+                            sendLineLocked("setoption name UCI_Elo value $clampedElo")
+                            lastUciElo = clampedElo
+                            optionsChanged = true
+                        }
+                        lastSkillLevel = -1
                     }
                     else -> {
-                        // Below Stockfish UCI_Elo floor (1320): scale Skill Level 0..5
                         val skill = ((clampedElo - 400) * 5 / 920).coerceIn(0, 5)
-                        sendLineLocked("setoption name UCI_LimitStrength value false")
-                        sendLineLocked("setoption name Skill Level value $skill")
+                        if (lastLimitStrength != false) {
+                            sendLineLocked("setoption name UCI_LimitStrength value false")
+                            lastLimitStrength = false
+                            optionsChanged = true
+                        }
+                        if (lastSkillLevel != skill) {
+                            sendLineLocked("setoption name Skill Level value $skill")
+                            lastSkillLevel = skill
+                            optionsChanged = true
+                        }
+                        lastUciElo = -1
                     }
                 }
 
-                sendLineLocked("isready")
-                if (!waitForTokenLocked("readyok", 3000L)) {
-                    throw IllegalStateException("Stockfish not ready")
+                if (optionsChanged) {
+                    sendLineLocked("isready")
+                    if (!waitForTokenLocked("readyok", 3000L)) {
+                        throw IllegalStateException("Stockfish not ready")
+                    }
                 }
 
                 val fen = sourceBoard.toFen()
                 sendLineLocked("position fen $fen")
 
-                // Map depth slider (1..8) + Elo to Stockfish depth & responsive movetime cap
-                val sfDepth = when {
-                    clampedElo < 900 -> clampedDepth.coerceIn(1, 4)
-                    clampedElo < 1320 -> (clampedDepth + 1).coerceIn(2, 6)
-                    clampedElo >= 3200 -> (clampedDepth * 2 + 2).coerceIn(4, 18)
-                    else -> (clampedDepth + 4).coerceIn(3, 14)
-                }
-                val moveTimeMs = when {
-                    clampedDepth <= 2 -> 180
-                    clampedDepth <= 4 -> 380
-                    clampedDepth <= 6 -> 650
-                    else -> 1200
-                }
+                val budget = StockfishUciParser.searchBudgetFor(clampedDepth, clampedElo)
+                val sfDepth = budget.sfDepth
+                val moveTimeMs = budget.moveTimeMs
                 val interimMinDepth = if (sfDepth < StockfishUciParser.MIN_INTERIM_DEPTH) {
                     sfDepth.coerceAtLeast(1)
                 } else {
@@ -500,10 +607,11 @@ class StockfishUciEngine(private val context: Context) {
                     legalMoves = legalMoves,
                     rng = rng
                 )
-            } catch (_: Throwable) {
+            } catch (t: Throwable) {
                 searching.set(false)
                 destroyProcessLocked()
                 stockfishFailed = true
+                lastStartupError = "search: ${t.javaClass.simpleName}".take(80)
                 null
             }
         }
@@ -512,7 +620,8 @@ class StockfishUciEngine(private val context: Context) {
     private fun sendLineLocked(cmd: String) {
         val w = writer ?: throw IllegalStateException("Stockfish writer closed")
         w.write(cmd)
-        w.write("\n")
+        w.write("
+")
         w.flush()
     }
 
@@ -527,8 +636,10 @@ class StockfishUciEngine(private val context: Context) {
     }
 
     private fun destroyProcessLocked() {
+        resetCachedOptionsLocked()
         try {
-            writer?.write("quit\n")
+            writer?.write("quit
+")
             writer?.flush()
         } catch (_: Throwable) {
         }
@@ -559,5 +670,6 @@ class StockfishUciEngine(private val context: Context) {
 
     companion object {
         const val STOCKFISH_LIB_NAME = "libstockfish.so"
+        private const val COLD_START_TIMEOUT_MS = 10000L
     }
 }

@@ -187,10 +187,10 @@ class ChessEngineTest {
         assertEquals("e2e4", parsed6.scoredMove.move.toUci())
         assertEquals(28, parsed6.scoredMove.scoreCp)
 
-        // Below depth 7 -> never emit interim
+        // Below depth 5 -> never emit interim
         assertFalse(
             StockfishUciParser.shouldEmitInterim(
-                depth = 6,
+                depth = 4,
                 topMoveUci = "e2e4",
                 lastEmittedMoveUci = null,
                 nowMs = 1000L,
@@ -198,10 +198,10 @@ class ChessEngineTest {
             )
         )
 
-        // First emit at depth 7 -> emit immediately!
+        // First emit at depth 5 -> emit immediately!
         assertTrue(
             StockfishUciParser.shouldEmitInterim(
-                depth = 7,
+                depth = 5,
                 topMoveUci = "e2e4",
                 lastEmittedMoveUci = null,
                 nowMs = 1050L,
@@ -209,36 +209,36 @@ class ChessEngineTest {
             )
         )
 
-        // Same move 30ms later -> throttled
+        // Same move 20ms later -> throttled (< 35ms)
         assertFalse(
             StockfishUciParser.shouldEmitInterim(
+                depth = 6,
+                topMoveUci = "e2e4",
+                lastEmittedMoveUci = "e2e4",
+                nowMs = 1070L,
+                lastEmitMs = 1050L
+            )
+        )
+
+        // Same move 40ms later -> allowed (>= 35ms)
+        assertTrue(
+            StockfishUciParser.shouldEmitInterim(
+                depth = 7,
+                topMoveUci = "e2e4",
+                lastEmittedMoveUci = "e2e4",
+                nowMs = 1090L,
+                lastEmitMs = 1050L
+            )
+        )
+
+        // Top move changed just 10ms later -> emit immediately without waiting for 35ms throttle!
+        assertTrue(
+            StockfishUciParser.shouldEmitInterim(
                 depth = 8,
-                topMoveUci = "e2e4",
-                lastEmittedMoveUci = "e2e4",
-                nowMs = 1080L,
-                lastEmitMs = 1050L
-            )
-        )
-
-        // Same move 80ms later -> allowed
-        assertTrue(
-            StockfishUciParser.shouldEmitInterim(
-                depth = 9,
-                topMoveUci = "e2e4",
-                lastEmittedMoveUci = "e2e4",
-                nowMs = 1130L,
-                lastEmitMs = 1050L
-            )
-        )
-
-        // Top move changed just 15ms later -> emit immediately without waiting for 70ms throttle!
-        assertTrue(
-            StockfishUciParser.shouldEmitInterim(
-                depth = 10,
                 topMoveUci = "d2d4",
                 lastEmittedMoveUci = "e2e4",
-                nowMs = 1145L,
-                lastEmitMs = 1130L
+                nowMs = 1100L,
+                lastEmitMs = 1090L
             )
         )
 
@@ -259,5 +259,50 @@ class ChessEngineTest {
         assertEquals("Stockfish 19", built!!.engineName)
         assertEquals("e2e4", built.topMoves.first().move.toUci())
         assertEquals(28, built.whiteEvalCp)
+    }
+
+    @Test
+    fun multiPvPolicyAvoidsFiveLineSlowdownOnSingleArrowMode() {
+        // Single arrow + default style + >=95% accuracy -> MultiPV 1
+        assertEquals(
+            1,
+            StockfishUciParser.resolveActualMultiPv(
+                requestedMultiPv = 1,
+                clampedAcc = 100,
+                playStyle = PlayStyle.DEFAULT,
+                legalMoveCount = 20
+            )
+        )
+        // Single arrow + Human style + 93% accuracy -> MultiPV 2 (never 5!)
+        assertEquals(
+            2,
+            StockfishUciParser.resolveActualMultiPv(
+                requestedMultiPv = 1,
+                clampedAcc = 93,
+                playStyle = PlayStyle.HUMAN,
+                legalMoveCount = 20
+            )
+        )
+        // Multi-arrows enabled -> MultiPV 3
+        assertEquals(
+            3,
+            StockfishUciParser.resolveActualMultiPv(
+                requestedMultiPv = 3,
+                clampedAcc = 93,
+                playStyle = PlayStyle.HUMAN,
+                legalMoveCount = 20
+            )
+        )
+    }
+
+    @Test
+    fun depthBudgetScalesSubSecondUpToFiveSecondsAtMaxDepth() {
+        val d1 = StockfishUciParser.searchBudgetFor(1, 2400)
+        val d4 = StockfishUciParser.searchBudgetFor(4, 2400)
+        val d8 = StockfishUciParser.searchBudgetFor(8, 2400)
+
+        assertEquals(SearchBudget(sfDepth = 8, moveTimeMs = 150L), d1)
+        assertEquals(SearchBudget(sfDepth = 14, moveTimeMs = 750L), d4)
+        assertEquals(SearchBudget(sfDepth = 24, moveTimeMs = 5000L), d8)
     }
 }

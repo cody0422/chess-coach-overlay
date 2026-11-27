@@ -148,11 +148,12 @@ class OverlayService : Service() {
         setupPillBar()
         applyPrefsToViews()
 
-        // Pre-initialize Stockfish 19 binary in background, then run initial analysis (if our turn)
+        // Pre-initialize Stockfish 19 binary in background, then refresh engine badge & run initial analysis
         serviceScope.launch {
             withContext(Dispatchers.IO) {
                 engine.ensureInitialized()
             }
+            settingsController?.syncFromPrefs()
             triggerAnalysis()
         }
     }
@@ -660,6 +661,7 @@ class OverlayService : Service() {
     }
 
     private fun updateBoardVisibility() {
+        accessibilityBoardReader?.boardDetectedLocked = autoBoardDetectedVisible || manualAlignLocked
         val bv = boardView ?: return
         val shouldShow = when {
             currentMode == OverlayMode.ALIGN -> true
@@ -1047,7 +1049,14 @@ class OverlayService : Service() {
         val controller = settingsController ?: SettingsModalController(
             themedContext = themedContext,
             prefs = prefs,
-            engineNameProvider = { engine.activeEngineName },
+            engineNameProvider = {
+                val err = engine.lastStartupError
+                if (engine.activeEngineName == "Stockfish 19" || err.isNullOrBlank()) {
+                    engine.activeEngineName
+                } else {
+                    "${engine.activeEngineName} ($err)"
+                }
+            },
             screenReadStatusProvider = { describeScreenReadStatus() },
             needsScreenPermissionProvider = { prefs.autoReadScreen && !hasActiveAutoReadCapture() },
             onSettingsChanged = { reanalyze ->
@@ -1240,20 +1249,17 @@ class OverlayService : Service() {
 
         refreshBoardView(analyzing = true)
 
+        val requestedMultiPv = if (prefs.showMultiArrows) 3 else 1
+
         analysisJob = serviceScope.launch {
-            val (feedback, result) = withContext(Dispatchers.Default) {
-                val fb = if (gradeBefore != null && gradedMove != null) {
-                    engine.evaluateMoveQuality(gradeBefore, gradedMove, cachedBestBefore, depth = 3)
-                } else {
-                    null
-                }
-                val res = engine.analyze(
+            val result = withContext(Dispatchers.Default) {
+                engine.analyze(
                     sourceBoard = boardCopy,
                     targetElo = elo,
                     searchDepth = depth,
                     targetAccuracy = acc,
                     playStyle = style,
-                    multiPv = 3,
+                    multiPv = requestedMultiPv,
                     onInterimResult = { interim ->
                         mainHandler.post {
                             if (!isRunning || gen != analysisGeneration) return@post
@@ -1270,18 +1276,24 @@ class OverlayService : Service() {
                         }
                     }
                 )
-                fb to res
             }
             if (!isActive || gen != analysisGeneration) return@launch
-            if (feedback != null) {
-                lastFeedback = feedback
-            }
             if (TurnArrowPolicy.shouldShowArrow(prefs.myTurnOnly, board.sideToMove, prefs.playingAsWhite)) {
                 lastAnalysis = result
             } else {
                 lastAnalysis = null
             }
             refreshBoardView(analyzing = false)
+
+            // Grade the previous move AFTER our best-move arrow is already drawn so it NEVER delays arrows
+            if (gradeBefore != null && gradedMove != null && isActive && gen == analysisGeneration) {
+                val feedback = withContext(Dispatchers.Default) {
+                    engine.evaluateMoveQuality(gradeBefore, gradedMove, cachedBestBefore, depth = 3)
+                }
+                if (!isActive || gen != analysisGeneration) return@launch
+                lastFeedback = feedback
+                refreshBoardView(analyzing = false)
+            }
         }
     }
 

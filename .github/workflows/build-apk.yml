@@ -98,7 +98,8 @@ jobs:
             ## ChessCoachOverlay v2.4.1
             - **Fixed No-Red-Box Accessibility Screenshots (`AndroidManifest.xml`):** Corrected `AccessibilityService` meta-data tag (`android.accessibilityservice`) so Android loads `@xml/accessibility_service_config` and grants `canTakeScreenshot` cleanly — eliminating the stuck `"Waiting for screen frames..."` state
             - **Clock-Safe Event Debounce + Watchdog:** Prevents Chess.com's ticking clock events from starving Accessibility board reads and adds a 3-second watchdog guard on in-flight screenshots
-            - **Live Capture Error Telemetry:** Surfaces any Accessibility screenshot error immediately in Settings instead of hiding it behind `"Waiting for screen frames..."`
+            - **Blazing Fast Sub-Second Arrows (up to 5s at Depth 8):** Eliminated the hidden `MultiPV = 5` bottleneck (now `MultiPV = 1` or `2` in single-arrow mode), cached Stockfish 19 UCI options across moves, upgraded to 2–4 threads + 64 MB hash, streamed first arrow from depth 5 (35ms throttle), ran move-quality grading *after* arrows are drawn with strict 150ms/450ms caps, tightened Accessibility settle to 75ms (2.2s locked heartbeat so it never burns the OS cooldown), and tightened Cast polling to 140ms
+            - **Live Capture Error & Engine Telemetry:** Surfaces any Accessibility screenshot error immediately in Settings and displays active engine status
             - **Built on v2.4.0:** Official **Stockfish 19 (`sf_19` ARM64 NNUE)** with live ~50ms move streaming, 60fps animated sleek black arrow, `My Turn Only` (your pieces only), 64/64 Ocean board reader, and automatic White/Black orientation detection
           files: |
             ChessCoachOverlay.apk

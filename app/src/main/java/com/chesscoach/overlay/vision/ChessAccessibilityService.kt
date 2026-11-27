@@ -356,6 +356,9 @@ class AccessibilityBoardReader(
     var lockedScreenRect: PixelRect? = null
 
     @Volatile
+    var boardDetectedLocked: Boolean = false
+
+    @Volatile
     var activeArrow: Move? = null
 
     @Volatile
@@ -378,11 +381,18 @@ class AccessibilityBoardReader(
         override fun run() {
             if (!running.get()) return
             val now = SystemClock.uptimeMillis()
-            if (now >= nextAllowedCaptureMs && (now - lastCaptureAttemptMs) >= MIN_CAPTURE_INTERVAL_MS) {
+            val isBoardLocked = lockedScreenRect != null || boardDetectedLocked
+            val minHeartbeatGap = if (isBoardLocked) HEARTBEAT_LOCKED_INTERVAL_MS else MIN_CAPTURE_INTERVAL_MS
+            if (now >= nextAllowedCaptureMs && (now - lastCaptureAttemptMs) >= minHeartbeatGap) {
                 requestCaptureNow()
             }
             if (running.get()) {
-                bgHandler?.postDelayed(this, HEARTBEAT_INTERVAL_MS)
+                val nextDelay = if (lockedScreenRect != null || boardDetectedLocked) {
+                    HEARTBEAT_LOCKED_INTERVAL_MS
+                } else {
+                    HEARTBEAT_INTERVAL_MS
+                }
+                bgHandler?.postDelayed(this, nextDelay)
             }
         }
     }
@@ -599,10 +609,11 @@ class AccessibilityBoardReader(
     }
 
     companion object {
-        private const val INITIAL_CAPTURE_DELAY_MS = 180L
-        private const val EVENT_SETTLE_DELAY_MS = 140L
+        private const val INITIAL_CAPTURE_DELAY_MS = 120L
+        private const val EVENT_SETTLE_DELAY_MS = 75L
         private const val MIN_CAPTURE_INTERVAL_MS = 1020L
         private const val HEARTBEAT_INTERVAL_MS = 1100L
+        private const val HEARTBEAT_LOCKED_INTERVAL_MS = 2200L
         private const val RATE_LIMIT_BACKOFF_MS = 650L
     }
 }

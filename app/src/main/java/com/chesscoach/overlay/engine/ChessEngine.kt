@@ -38,7 +38,8 @@ class ChessEngine {
         targetAccuracy: Int = EloAccuracyHelper.DEFAULT_ACCURACY,
         playStyle: PlayStyle = PlayStyle.DEFAULT,
         multiPv: Int = 3,
-        rng: Random = Random.Default
+        rng: Random = Random.Default,
+        maxTimeMs: Long = 450L
     ): AnalysisResult {
         aborted.set(false)
         nodes = 0L
@@ -88,12 +89,12 @@ class ChessEngine {
             else -> 8_000L
         }
 
-        val timeBudgetMs = when {
-            effectiveDepth <= 2 -> 180L
-            effectiveDepth <= 4 -> 550L
-            effectiveDepth <= 6 -> 1200L
-            else -> 1900L
+        val rawBudgetMs = when {
+            effectiveDepth <= 2 -> 150L
+            effectiveDepth <= 4 -> 320L
+            else -> 450L
         }
+        val timeBudgetMs = min(rawBudgetMs, maxTimeMs.coerceAtLeast(30L))
         deadlineMs = System.currentTimeMillis() + timeBudgetMs
 
         val wantCandidates = if (clampedAcc < 100 || clampedElo < 2600 || playStyle != PlayStyle.DEFAULT) {
@@ -159,6 +160,9 @@ class ChessEngine {
         val bestScoreBefore: Int
         val wasTopMove: Boolean
 
+        val evalBudgetStart = System.currentTimeMillis()
+        val totalEvalBudgetMs = 150L
+
         if (cachedBestBefore != null) {
             bestScoreBefore = cachedBestBefore.scoreCp
             wasTopMove = cachedBestBefore.move.from == playedMove.from &&
@@ -168,9 +172,10 @@ class ChessEngine {
             val res = analyze(
                 sourceBoard = boardBefore,
                 targetElo = 3600,
-                searchDepth = depth.coerceIn(2, 4),
+                searchDepth = depth.coerceIn(2, 3),
                 targetAccuracy = 100,
-                multiPv = 1
+                multiPv = 1,
+                maxTimeMs = 75L
             )
             val best = res.topMoves.firstOrNull()
             bestScoreBefore = best?.scoreCp ?: 0
@@ -180,6 +185,7 @@ class ChessEngine {
                 Piece.typeOf(best.move.promotion) == Piece.typeOf(playedMove.promotion)
         }
 
+        val remainingBudgetMs = (totalEvalBudgetMs - (System.currentTimeMillis() - evalBudgetStart)).coerceIn(40L, totalEvalBudgetMs)
         val after = boardBefore.copy()
         after.pushMove(playedMove)
         val afterRes = analyze(
@@ -187,7 +193,8 @@ class ChessEngine {
             targetElo = 3600,
             searchDepth = (depth - 1).coerceIn(2, 3),
             targetAccuracy = 100,
-            multiPv = 1
+            multiPv = 1,
+            maxTimeMs = remainingBudgetMs
         )
         // afterRes.whiteEvalCp is from White's perspective; convert to mover's perspective
         val playedEvalMover = if (mover == Piece.WHITE) afterRes.whiteEvalCp else -afterRes.whiteEvalCp
@@ -406,7 +413,7 @@ class ChessEngine {
             aborted.set(true)
             return true
         }
-        if ((nodes and 1023L) == 0L && System.currentTimeMillis() >= deadlineMs) {
+        if ((nodes and 255L) == 0L && System.currentTimeMillis() >= deadlineMs) {
             aborted.set(true)
             return true
         }
