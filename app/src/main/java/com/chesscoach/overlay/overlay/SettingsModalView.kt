@@ -92,6 +92,10 @@ class SettingsModalController(
         bindListeners()
     }
 
+    fun updateScreenReadStatus(status: String) {
+        tvScreenReadStatus.text = status
+    }
+
     fun syncFromPrefs() {
         syncing = true
         try {

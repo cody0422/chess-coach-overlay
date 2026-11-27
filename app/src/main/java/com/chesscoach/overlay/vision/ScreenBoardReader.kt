@@ -18,14 +18,16 @@ import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.min
 
 /**
- * Android 14+ (API 34) safe MediaProjection screen-capture reader.
+ * Android 14/15 (API 34+) safe MediaProjection screen-capture reader.
  *
- * Lifecycle order enforced:
+ * Key guarantees:
  * 1. Caller MUST have already called startForeground(..., FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION).
- * 2. getMediaProjection(resultCode, data)
- * 3. mediaProjection.registerCallback(callback, mainHandler) BEFORE createVirtualDisplay(...)
- * 4. ImageReader (RGBA_8888, downscaled to ~540px width for low-CPU/battery capture)
- * 5. Poll latest frame every ~450ms on a background thread, always closing Image in finally {}
+ * 2. mediaProjection.registerCallback(callback, mainHandler) runs BEFORE createVirtualDisplay(...).
+ * 3. VirtualDisplay DPI is scaled proportionally to the downscaled capture width.
+ * 4. ImageReader.setOnImageAvailableListener immediately copies every new frame into a reusable
+ *    latestPixels buffer (closing Image in finally {}), and the 450ms capture tick re-analyzes
+ *    latestPixels even on static screens (e.g. offline/bot games without a ticking clock) so
+ *    BoardTrackingSession never starves for consecutive frames.
  */
 class ScreenBoardReader(
     private val context: Context,
@@ -46,7 +48,13 @@ class ScreenBoardReader(
     private var screenHeight: Int = 2400
     private var capWidth: Int = 540
     private var capHeight: Int = 1200
-    private var pixelBuffer: IntArray = IntArray(0)
+
+    // Accessed exclusively on bgHandler (serialized across ImageAvailableListener & captureRunnable)
+    private var latestPixels: IntArray = IntArray(0)
+    private var latestWidth: Int = 0
+    private var latestHeight: Int = 0
+    private var hasLatestFrame: Boolean = false
+    private var framesCaptured: Long = 0L
 
     @Volatile
     var lockedScreenRect: PixelRect? = null
@@ -95,7 +103,13 @@ class ScreenBoardReader(
 
         capWidth = min(screenWidth, TARGET_CAPTURE_WIDTH).coerceAtLeast(320) and 1.inv()
         capHeight = ((screenHeight.toLong() * capWidth) / screenWidth).toInt().coerceAtLeast(320) and 1.inv()
-        pixelBuffer = IntArray(capWidth * capHeight)
+        val capDpi = ((dpi.toLong() * capWidth) / screenWidth).toInt().coerceAtLeast(120)
+
+        latestPixels = IntArray(capWidth * capHeight)
+        latestWidth = 0
+        latestHeight = 0
+        hasLatestFrame = false
+        framesCaptured = 0L
 
         val thread = HandlerThread("ScreenBoardReader").apply { start() }
         val handler = Handler(thread.looper)
@@ -109,13 +123,20 @@ class ScreenBoardReader(
             mp.registerCallback(projectionCallback, mainHandler)
 
             val reader = ImageReader.newInstance(capWidth, capHeight, PixelFormat.RGBA_8888, 2)
+            reader.setOnImageAvailableListener({ r ->
+                try {
+                    drainLatestImageIntoBuffer(r)
+                } catch (_: Throwable) {
+                }
+            }, handler)
             imageReader = reader
+            running.set(true)
 
             val vd = mp.createVirtualDisplay(
                 "ChessBoardCapture",
                 capWidth,
                 capHeight,
-                dpi,
+                capDpi,
                 DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
                 reader.surface,
                 null,
@@ -126,7 +147,6 @@ class ScreenBoardReader(
                 return false
             }
             virtualDisplay = vd
-            running.set(true)
             handler.postDelayed(captureRunnable, INITIAL_DELAY_MS)
             return true
         } catch (_: Throwable) {
@@ -146,6 +166,10 @@ class ScreenBoardReader(
         }
         virtualDisplay = null
 
+        try {
+            imageReader?.setOnImageAvailableListener(null, null)
+        } catch (_: Throwable) {
+        }
         try {
             imageReader?.close()
         } catch (_: Throwable) {
@@ -174,29 +198,33 @@ class ScreenBoardReader(
         }
         bgThread = null
         bgHandler = null
+        hasLatestFrame = false
+        framesCaptured = 0L
+        latestWidth = 0
+        latestHeight = 0
     }
 
-    private fun captureAndAnalyzeOnce() {
-        val reader = imageReader ?: return
+    private fun drainLatestImageIntoBuffer(reader: ImageReader): Boolean {
+        if (!running.get()) return false
         val image = try {
             reader.acquireLatestImage()
         } catch (_: Throwable) {
             null
-        } ?: return
+        } ?: return false
 
-        val analysis: FrameAnalysis
         try {
             val imgW = image.width
             val imgH = image.height
-            if (imgW <= 0 || imgH <= 0) return
+            if (imgW <= 0 || imgH <= 0) return false
 
             val plane = image.planes[0]
             val buffer = plane.buffer
             val pixelStride = plane.pixelStride
             val rowStride = plane.rowStride
 
-            if (pixelBuffer.size < imgW * imgH) {
-                pixelBuffer = IntArray(imgW * imgH)
+            val needed = imgW * imgH
+            if (latestPixels.size < needed) {
+                latestPixels = IntArray(needed)
             }
 
             var outIdx = 0
@@ -207,32 +235,76 @@ class ScreenBoardReader(
                     val r = buffer.get(off).toInt() and 0xFF
                     val g = buffer.get(off + 1).toInt() and 0xFF
                     val b = buffer.get(off + 2).toInt() and 0xFF
-                    pixelBuffer[outIdx++] = (0xFF shl 24) or (r shl 16) or (g shl 8) or b
+                    latestPixels[outIdx++] = (0xFF shl 24) or (r shl 16) or (g shl 8) or b
                 }
             }
 
-            val scaleToScreenX = screenWidth.toFloat() / imgW.toFloat()
-            val scaleToScreenY = screenHeight.toFloat() / imgH.toFloat()
-
-            val lockedCapRect = lockedScreenRect?.let { sr ->
-                PixelRect(
-                    left = (sr.left / scaleToScreenX).toInt().coerceIn(0, imgW - 1),
-                    top = (sr.top / scaleToScreenY).toInt().coerceIn(0, imgH - 1),
-                    width = (sr.width / scaleToScreenX).toInt().coerceAtLeast(16),
-                    height = (sr.height / scaleToScreenY).toInt().coerceAtLeast(16)
-                )
-            }
-
-            val raw = BoardVisionAnalyzer.analyzeFrame(pixelBuffer, imgW, imgH, lockedCapRect)
-            val scaledDetection = if (raw.detection.found) {
-                raw.detection.copy(rect = raw.detection.rect.scaled(scaleToScreenX, scaleToScreenY))
-            } else {
-                raw.detection
-            }
-            analysis = FrameAnalysis(scaledDetection, raw.grid)
+            latestWidth = imgW
+            latestHeight = imgH
+            hasLatestFrame = true
+            framesCaptured++
+            return true
         } finally {
             image.close()
         }
+    }
+
+    private fun captureAndAnalyzeOnce() {
+        val reader = imageReader ?: return
+
+        // Step 1: Drain any newly rendered frame first
+        try {
+            drainLatestImageIntoBuffer(reader)
+        } catch (_: Throwable) {
+        }
+
+        // Step 2: If no screen frame has arrived yet, still report diagnostic heartbeat
+        if (!hasLatestFrame || latestWidth <= 0 || latestHeight <= 0) {
+            val waitingAnalysis = FrameAnalysis(
+                detection = BoardDetectionResult.NOT_FOUND,
+                grid = null,
+                framesCaptured = framesCaptured,
+                lastBestScore = 0f,
+                lastDetectionNote = "Waiting for screen frames..."
+            )
+            if (running.get()) {
+                mainHandler.post {
+                    if (running.get()) {
+                        onFrameAnalyzed(waitingAnalysis)
+                    }
+                }
+            }
+            return
+        }
+
+        // Step 3: Analyze latestPixels even when screen is static (no new frame since last tick)
+        val imgW = latestWidth
+        val imgH = latestHeight
+        val scaleToScreenX = screenWidth.toFloat() / imgW.toFloat()
+        val scaleToScreenY = screenHeight.toFloat() / imgH.toFloat()
+
+        val lockedCapRect = lockedScreenRect?.let { sr ->
+            PixelRect(
+                left = (sr.left / scaleToScreenX).toInt().coerceIn(0, imgW - 1),
+                top = (sr.top / scaleToScreenY).toInt().coerceIn(0, imgH - 1),
+                width = (sr.width / scaleToScreenX).toInt().coerceAtLeast(16),
+                height = (sr.height / scaleToScreenY).toInt().coerceAtLeast(16)
+            )
+        }
+
+        val raw = BoardVisionAnalyzer.analyzeFrame(latestPixels, imgW, imgH, lockedCapRect)
+        val scaledDetection = if (raw.detection.found) {
+            raw.detection.copy(rect = raw.detection.rect.scaled(scaleToScreenX, scaleToScreenY))
+        } else {
+            raw.detection
+        }
+        val analysis = FrameAnalysis(
+            detection = scaledDetection,
+            grid = raw.grid,
+            framesCaptured = framesCaptured,
+            lastBestScore = raw.lastBestScore,
+            lastDetectionNote = raw.lastDetectionNote
+        )
 
         if (running.get()) {
             mainHandler.post {

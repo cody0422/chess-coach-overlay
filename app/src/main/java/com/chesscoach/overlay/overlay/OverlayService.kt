@@ -75,6 +75,9 @@ class OverlayService : Service() {
     private var hasMediaProjectionGrant: Boolean = false
     private var autoBoardDetectedVisible: Boolean = false
     private var manualAlignLocked: Boolean = false
+    private var lastFramesCaptured: Long = 0L
+    private var lastDetectionBestScore: Float = 0f
+    private var lastDetectionNote: String = ""
 
     private var boardView: BoardOverlayView? = null
     private var boardParams: WindowManager.LayoutParams? = null
@@ -244,6 +247,9 @@ class OverlayService : Service() {
         stopScreenCapture()
         trackingSession.resetTracking()
         autoBoardDetectedVisible = false
+        lastFramesCaptured = 0L
+        lastDetectionBestScore = 0f
+        lastDetectionNote = ""
 
         val reader = ScreenBoardReader(
             context = this,
@@ -290,6 +296,9 @@ class OverlayService : Service() {
         screenBoardReader = null
         hasMediaProjectionGrant = false
         autoBoardDetectedVisible = false
+        lastFramesCaptured = 0L
+        lastDetectionBestScore = 0f
+        lastDetectionNote = ""
         trackingSession.resetTracking()
     }
 
@@ -299,8 +308,17 @@ class OverlayService : Service() {
 
     private fun handleScreenFrame(analysis: FrameAnalysis) {
         if (!isAutoReadLive()) return
-        // Don't fight the user while dragging/resizing in Align mode or browsing Settings
-        if (currentMode == OverlayMode.ALIGN || settingsAttached) return
+
+        lastFramesCaptured = analysis.framesCaptured
+        lastDetectionBestScore = analysis.lastBestScore
+        lastDetectionNote = analysis.lastDetectionNote
+
+        if (settingsAttached) {
+            settingsController?.updateScreenReadStatus(describeScreenReadStatus())
+            return
+        }
+        // Don't fight the user while dragging/resizing in Align mode
+        if (currentMode == OverlayMode.ALIGN) return
 
         val events = trackingSession.onFrame(
             analysis = analysis,
@@ -311,17 +329,23 @@ class OverlayService : Service() {
         for (ev in events) {
             when (ev) {
                 is BoardTrackingEvent.BoardHidden -> {
-                    autoBoardDetectedVisible = false
+                    if (!manualAlignLocked) {
+                        autoBoardDetectedVisible = false
+                    }
                     updateBoardVisibility()
                     updatePillVisualState()
                 }
                 is BoardTrackingEvent.BoardVisible -> {
+                    val justBecameVisible = !autoBoardDetectedVisible
                     autoBoardDetectedVisible = true
                     if (!manualAlignLocked) {
                         snapBoardOverlayToRect(ev.rect)
                     }
                     updateBoardVisibility()
                     updatePillVisualState()
+                    if (lastAnalysis == null || justBecameVisible) {
+                        triggerAnalysis()
+                    }
                 }
                 is BoardTrackingEvent.NewGameDetected -> {
                     autoBoardDetectedVisible = true
@@ -407,7 +431,7 @@ class OverlayService : Service() {
         val shouldShow = when {
             currentMode == OverlayMode.ALIGN -> true
             !overlayArrowsActive -> false
-            isAutoReadLive() -> autoBoardDetectedVisible
+            isAutoReadLive() -> autoBoardDetectedVisible || manualAlignLocked
             else -> true
         }
         val targetVis = if (shouldShow) View.VISIBLE else View.INVISIBLE
@@ -445,6 +469,10 @@ class OverlayService : Service() {
             gravity = Gravity.TOP or Gravity.START
             x = saved.x
             y = saved.y
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                layoutInDisplayCutoutMode =
+                    WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+            }
         }
 
         boardView = view
@@ -534,10 +562,16 @@ class OverlayService : Service() {
                 BoardRect(bp.x, bp.y, bp.width, bp.height)
             )
             manualAlignLocked = true
+            autoBoardDetectedVisible = true
             screenBoardReader?.lockedScreenRect = PixelRect(bp.x, bp.y, bp.width, bp.height)
         }
         val nextMode = if (prefs.tapInputMode) OverlayMode.TAP_MOVE else OverlayMode.PASS_THROUGH
         setOverlayMode(nextMode)
+        if (lastAnalysis == null) {
+            triggerAnalysis()
+        } else {
+            refreshBoardView(analyzing = false)
+        }
     }
 
     private fun setupPillBar() {
@@ -669,7 +703,7 @@ class OverlayService : Service() {
         if (dot != null) {
             val dotColor = when {
                 !overlayArrowsActive -> Color.parseColor("#64748B")
-                isAutoReadLive() && autoBoardDetectedVisible -> Color.parseColor("#22C55E")
+                isAutoReadLive() && (autoBoardDetectedVisible || manualAlignLocked) -> Color.parseColor("#22C55E")
                 isAutoReadLive() -> Color.parseColor("#F59E0B")
                 else -> Color.parseColor("#38BDF8")
             }
@@ -684,10 +718,15 @@ class OverlayService : Service() {
 
     private fun describeScreenReadStatus(): String {
         return when {
-            isAutoReadLive() && autoBoardDetectedVisible ->
-                if (manualAlignLocked) "Auto-Read: Locked (custom align)" else "Auto-Read: Locked on board"
+            isAutoReadLive() && (autoBoardDetectedVisible || manualAlignLocked) -> {
+                val side = if (prefs.playingAsWhite) "White" else "Black"
+                val moveNum = board.fullMoveNumber
+                "Auto-Read: Locked ($side · move $moveNum)"
+            }
+            isAutoReadLive() && lastFramesCaptured == 0L ->
+                "Auto-Read: Waiting for screen frames..."
             isAutoReadLive() ->
-                "Auto-Read: Scanning for board…"
+                "Auto-Read: Scanning (${lastFramesCaptured}f) — open a game"
             prefs.autoReadScreen && !hasMediaProjectionGrant ->
                 "Auto-Read: Needs screen permission (tap Start in app)"
             prefs.tapInputMode ->

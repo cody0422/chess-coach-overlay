@@ -70,17 +70,27 @@ data class LegalMoveMatch(
 
 data class FrameAnalysis(
     val detection: BoardDetectionResult,
-    val grid: Array<SquareOccupancy>?
+    val grid: Array<SquareOccupancy>?,
+    val framesCaptured: Long = 0L,
+    val lastBestScore: Float = detection.confidence,
+    val lastDetectionNote: String = ""
 ) {
     override fun equals(other: Any?): Boolean {
         if (this === other) return true
         if (other !is FrameAnalysis) return false
-        return detection == other.detection && grid.contentEquals(other.grid)
+        return detection == other.detection &&
+            grid.contentEquals(other.grid) &&
+            framesCaptured == other.framesCaptured &&
+            lastBestScore == other.lastBestScore &&
+            lastDetectionNote == other.lastDetectionNote
     }
 
     override fun hashCode(): Int {
         var result = detection.hashCode()
         result = 31 * result + (grid?.contentHashCode() ?: 0)
+        result = 31 * result + framesCaptured.hashCode()
+        result = 31 * result + lastBestScore.hashCode()
+        result = 31 * result + lastDetectionNote.hashCode()
         return result
     }
 }
@@ -91,9 +101,11 @@ data class FrameAnalysis(
  */
 object BoardVisionAnalyzer {
 
-    private val CORNER_OX = floatArrayOf(0.86f, 0.14f, 0.50f, 0.50f)
-    private val CORNER_OY = floatArrayOf(0.14f, 0.86f, 0.08f, 0.92f)
-    private val CANDIDATE_WIDTH_FRACS = floatArrayOf(1.00f, 0.96f, 0.92f, 0.88f, 0.85f)
+    // Safe inner corners (15% inside each square): far from seams even under coarse-step offset
+    // AND well outside tapered piece crowns/bases and corner rank/file coordinate letters.
+    private val CORNER_OX = floatArrayOf(0.15f, 0.85f, 0.15f, 0.85f)
+    private val CORNER_OY = floatArrayOf(0.15f, 0.15f, 0.85f, 0.85f)
+    private val CANDIDATE_WIDTH_FRACS = floatArrayOf(1.00f, 0.98f, 0.95f, 0.92f, 0.88f, 0.84f, 0.80f)
 
     private data class CandidateEval(
         val valid: Boolean,
@@ -107,6 +119,43 @@ object BoardVisionAnalyzer {
         val oddRgb: Rgb
     )
 
+    private data class SeamMetrics(
+        val wideRatio: Float,
+        val tightRatio: Float,
+        val vSeamsHit: Int,
+        val hSeamsHit: Int
+    )
+
+    private data class CoarsePeak(
+        val score: Float,
+        val left: Int,
+        val top: Int,
+        val size: Int
+    )
+
+    private class CandidateScratch {
+        val sqR = IntArray(64)
+        val sqG = IntArray(64)
+        val sqB = IntArray(64)
+        val evenR = IntArray(32)
+        val evenG = IntArray(32)
+        val evenB = IntArray(32)
+        val oddR = IntArray(32)
+        val oddG = IntArray(32)
+        val oddB = IntArray(32)
+        val rowEven = IntArray(8)
+        val rowOdd = IntArray(8)
+        val colEven = IntArray(8)
+        val colOdd = IntArray(8)
+        val tmpRgb = IntArray(3)
+    }
+
+    private data class DetectionInternal(
+        val result: BoardDetectionResult,
+        val bestScore: Float,
+        val note: String
+    )
+
     fun analyzeFrame(
         pixels: IntArray,
         width: Int,
@@ -114,174 +163,291 @@ object BoardVisionAnalyzer {
         lockedRect: PixelRect? = null
     ): FrameAnalysis {
         if (width < 64 || height < 64 || pixels.size < width * height) {
-            return FrameAnalysis(BoardDetectionResult.NOT_FOUND, null)
+            return FrameAnalysis(
+                detection = BoardDetectionResult.NOT_FOUND,
+                grid = null,
+                lastBestScore = 0f,
+                lastDetectionNote = "invalid frame"
+            )
         }
-        val detection = if (lockedRect != null && lockedRect.width >= 64 && lockedRect.height >= 64) {
-            verifyLockedBoard(pixels, width, height, lockedRect)
+        val detInternal = if (lockedRect != null && lockedRect.width >= 64 && lockedRect.height >= 64) {
+            verifyLockedBoardInternal(pixels, width, height, lockedRect)
         } else {
-            detectBoard(pixels, width, height)
+            detectBoardInternal(pixels, width, height)
         }
+        val detection = detInternal.result
         if (!detection.found) {
-            return FrameAnalysis(detection, null)
+            return FrameAnalysis(
+                detection = detection,
+                grid = null,
+                lastBestScore = detInternal.bestScore,
+                lastDetectionNote = detInternal.note
+            )
         }
         val grid = classifyGrid(pixels, width, height, detection)
-        return FrameAnalysis(detection, grid)
+        return FrameAnalysis(
+            detection = detection,
+            grid = grid,
+            lastBestScore = detInternal.bestScore,
+            lastDetectionNote = detInternal.note
+        )
     }
 
     /**
      * Scans a screen buffer looking for a large centered square 8x8 chess board
-     * (width ~85%-100% of screen width, y within ~10%-86% of screen height).
+     * (width ~80%-100% of screen width, y within ~5%-92% of screen height).
      */
     fun detectBoard(pixels: IntArray, width: Int, height: Int): BoardDetectionResult {
+        return detectBoardInternal(pixels, width, height).result
+    }
+
+    private fun detectBoardInternal(pixels: IntArray, width: Int, height: Int): DetectionInternal {
         if (width < 64 || height < 64 || pixels.size < width * height) {
-            return BoardDetectionResult.NOT_FOUND
+            return DetectionInternal(BoardDetectionResult.NOT_FOUND, 0f, "invalid frame")
         }
 
+        val scratch = CandidateScratch()
         val minDim = min(width, height)
-        val yMin = (height * 0.08f).toInt().coerceAtLeast(0)
-        val yMaxTotal = (height * 0.88f).toInt().coerceAtMost(height)
+        val yMin = (height * 0.05f).toInt().coerceAtLeast(0)
+        val yMaxTotal = (height * 0.92f).toInt().coerceAtMost(height)
 
-        var bestScore = 0f
-        var bestLeft = 0
-        var bestTop = 0
-        var bestSize = 0
-        var bestEval: CandidateEval? = null
+        var bestCoarseScore = 0f
+        val peaks = ArrayList<CoarsePeak>(8)
 
-        // Stage 1: Coarse scan across portrait widths and vertical positions
+        // Stage 1: Fast dense coarse scan across portrait widths and vertical positions.
+        // stepY = max(4, size / 90) keeps max vertical offset <= ~3px, safely inside the
+        // 0.15 * sq (~10px) inner corner margin.
         for (frac in CANDIDATE_WIDTH_FRACS) {
             val size = (minDim * frac).roundToInt().coerceIn(64, minDim)
             val left = (width - size) / 2
             val maxTop = (yMaxTotal - size).coerceAtLeast(yMin)
-            val stepY = max(6, size / 28)
+            val stepY = max(4, size / 90)
 
             var top = yMin
             while (top <= maxTop) {
-                val ev = evaluateCandidate(pixels, width, height, left, top, size, checkSeams = false)
-                if (ev.score > bestScore) {
-                    bestScore = ev.score
-                    bestLeft = left
-                    bestTop = top
-                    bestSize = size
-                    bestEval = ev
+                val ev = evaluateCandidate(pixels, width, height, left, top, size, checkSeams = false, scratch = scratch)
+                if (ev.score > bestCoarseScore) {
+                    bestCoarseScore = ev.score
+                }
+                if (ev.score > 0.10f) {
+                    var merged = false
+                    for (i in peaks.indices) {
+                        val p = peaks[i]
+                        if (abs(p.top - top) < 24 && abs(p.size - size) < 24) {
+                            if (ev.score > p.score) {
+                                peaks[i] = CoarsePeak(ev.score, left, top, size)
+                            }
+                            merged = true
+                            break
+                        }
+                    }
+                    if (!merged) {
+                        peaks.add(CoarsePeak(ev.score, left, top, size))
+                        peaks.sortByDescending { it.score }
+                        if (peaks.size > 6) {
+                            peaks.removeAt(peaks.lastIndex)
+                        }
+                    }
                 }
                 top += stepY
             }
         }
 
-        if (bestEval == null || bestScore <= 0.15f) {
-            return BoardDetectionResult.NOT_FOUND
+        if (peaks.isEmpty()) {
+            return DetectionInternal(BoardDetectionResult.NOT_FOUND, bestCoarseScore, "no coarse candidate")
         }
 
-        // Stage 2: Fine coordinate refinement around best coarse candidate (with seam alignment)
-        var curLeft = bestLeft
-        var curTop = bestTop
-        var curSize = bestSize
-        var curEval = evaluateCandidate(pixels, width, height, curLeft, curTop, curSize, checkSeams = true)
-        var curScore = curEval.score
+        peaks.sortByDescending { it.score }
 
+        // Stage 2: Fine coordinate refinement around the top distinct coarse peaks (with seam alignment)
+        var bestFinalEval: CandidateEval? = null
+        var bestFinalLeft = 0
+        var bestFinalTop = 0
+        var bestFinalSize = 0
+        var bestRefinedScore = bestCoarseScore
+
+        val peaksToRefine = min(4, peaks.size)
         val refineSteps = intArrayOf(8, 4, 2, 1)
-        for (step in refineSteps) {
-            var improved = true
-            var passes = 0
-            while (improved && passes < 4) {
-                improved = false
-                passes++
-                // Try shifting top
-                for (dt in intArrayOf(-step, step)) {
-                    val nt = curTop + dt
-                    if (nt >= 0 && nt + curSize <= height) {
-                        val ev = evaluateCandidate(pixels, width, height, curLeft, nt, curSize, checkSeams = true)
-                        if (ev.score > curScore + 0.0005f) {
-                            curTop = nt
-                            curEval = ev
-                            curScore = ev.score
-                            improved = true
+        val minRefineSize = (minDim * 0.78f).toInt().coerceAtLeast(64)
+
+        for (pi in 0 until peaksToRefine) {
+            val peak = peaks[pi]
+            var curLeft = peak.left
+            var curTop = peak.top
+            var curSize = peak.size
+            var curEval = evaluateCandidate(pixels, width, height, curLeft, curTop, curSize, checkSeams = true, scratch = scratch)
+            var curScore = curEval.score
+
+            for (step in refineSteps) {
+                var improved = true
+                var passes = 0
+                while (improved && passes < 4) {
+                    improved = false
+                    passes++
+                    // Try shifting top
+                    for (dt in intArrayOf(-step, step)) {
+                        val nt = curTop + dt
+                        if (nt >= 0 && nt + curSize <= height) {
+                            val ev = evaluateCandidate(pixels, width, height, curLeft, nt, curSize, checkSeams = true, scratch = scratch)
+                            if (ev.score > curScore + 0.0005f) {
+                                curTop = nt
+                                curEval = ev
+                                curScore = ev.score
+                                improved = true
+                            }
                         }
                     }
-                }
-                // Try adjusting size (keeping centered or nudging left)
-                for (ds in intArrayOf(-step * 2, step * 2)) {
-                    val ns = curSize + ds
-                    val minS = (minDim * 0.80f).toInt().coerceAtLeast(64)
-                    if (ns in minS..minDim) {
-                        val nl = ((width - ns) / 2).coerceIn(0, width - ns)
-                        val nt = (curTop - ds / 2).coerceIn(0, height - ns)
-                        val ev = evaluateCandidate(pixels, width, height, nl, nt, ns, checkSeams = true)
-                        if (ev.score > curScore + 0.0005f) {
-                            curLeft = nl
-                            curTop = nt
-                            curSize = ns
-                            curEval = ev
-                            curScore = ev.score
-                            improved = true
+                    // Try adjusting size (keeping centered vertically/horizontally)
+                    for (ds in intArrayOf(-step * 2, step * 2)) {
+                        val ns = curSize + ds
+                        if (ns in minRefineSize..minDim) {
+                            val nl = ((width - ns) / 2).coerceIn(0, width - ns)
+                            val nt = (curTop - ds / 2).coerceIn(0, height - ns)
+                            val ev = evaluateCandidate(pixels, width, height, nl, nt, ns, checkSeams = true, scratch = scratch)
+                            if (ev.score > curScore + 0.0005f) {
+                                curLeft = nl
+                                curTop = nt
+                                curSize = ns
+                                curEval = ev
+                                curScore = ev.score
+                                improved = true
+                            }
                         }
                     }
-                }
-                // Try slight horizontal nudge
-                for (dl in intArrayOf(-step, step)) {
-                    val nl = curLeft + dl
-                    if (nl >= 0 && nl + curSize <= width) {
-                        val ev = evaluateCandidate(pixels, width, height, nl, curTop, curSize, checkSeams = true)
-                        if (ev.score > curScore + 0.0005f) {
-                            curLeft = nl
-                            curEval = ev
-                            curScore = ev.score
-                            improved = true
+                    // Try slight horizontal nudge
+                    for (dl in intArrayOf(-step, step)) {
+                        val nl = curLeft + dl
+                        if (nl >= 0 && nl + curSize <= width) {
+                            val ev = evaluateCandidate(pixels, width, height, nl, curTop, curSize, checkSeams = true, scratch = scratch)
+                            if (ev.score > curScore + 0.0005f) {
+                                curLeft = nl
+                                curEval = ev
+                                curScore = ev.score
+                                improved = true
+                            }
                         }
                     }
                 }
             }
+
+            if (curScore > bestRefinedScore) {
+                bestRefinedScore = curScore
+            }
+
+            val finalEval = evaluateCandidate(pixels, width, height, curLeft, curTop, curSize, checkSeams = true, scratch = scratch)
+            if (finalEval.valid && (bestFinalEval == null || finalEval.score > bestFinalEval.score)) {
+                bestFinalEval = finalEval
+                bestFinalLeft = curLeft
+                bestFinalTop = curTop
+                bestFinalSize = curSize
+            }
         }
 
-        val finalEval = evaluateCandidate(pixels, width, height, curLeft, curTop, curSize, checkSeams = true)
-        if (!finalEval.valid) {
-            return BoardDetectionResult.NOT_FOUND
-        }
+        val winner = bestFinalEval
+            ?: return DetectionInternal(
+                BoardDetectionResult.NOT_FOUND,
+                bestRefinedScore,
+                "failed seam/border check"
+            )
 
-        val evenLum = finalEval.evenRgb.luminance()
-        val oddLum = finalEval.oddRgb.luminance()
-        val lightRgb = if (evenLum >= oddLum) finalEval.evenRgb else finalEval.oddRgb
-        val darkRgb = if (evenLum >= oddLum) finalEval.oddRgb else finalEval.evenRgb
+        val evenLum = winner.evenRgb.luminance()
+        val oddLum = winner.oddRgb.luminance()
+        val lightRgb = if (evenLum >= oddLum) winner.evenRgb else winner.oddRgb
+        val darkRgb = if (evenLum >= oddLum) winner.oddRgb else winner.evenRgb
 
-        return BoardDetectionResult(
+        val result = BoardDetectionResult(
             found = true,
-            rect = PixelRect(curLeft, curTop, curSize, curSize),
-            confidence = finalEval.confidence.coerceIn(0f, 1f),
+            rect = PixelRect(bestFinalLeft, bestFinalTop, bestFinalSize, bestFinalSize),
+            confidence = winner.confidence.coerceIn(0f, 1f),
             lightRgb = lightRgb,
             darkRgb = darkRgb,
-            evenRgb = finalEval.evenRgb,
-            oddRgb = finalEval.oddRgb
+            evenRgb = winner.evenRgb,
+            oddRgb = winner.oddRgb
+        )
+        return DetectionInternal(
+            result = result,
+            bestScore = winner.score,
+            note = "locked ${bestFinalSize}px @ y=$bestFinalTop sep=${winner.separation.roundToInt()}"
         )
     }
 
-    private fun verifyLockedBoard(
+    /**
+     * Verifies a user-locked manual Align box. Accepts the box as visible as long as the two
+     * checkerboard parities have distinct median colors (sep >= 12f), so manual Align ALWAYS
+     * works reliably as an instant fallback across any theme or board layout.
+     */
+    private fun verifyLockedBoardInternal(
         pixels: IntArray,
         width: Int,
         height: Int,
         rect: PixelRect
-    ): BoardDetectionResult {
+    ): DetectionInternal {
         val left = rect.left.coerceIn(0, width - 8)
         val top = rect.top.coerceIn(0, height - 8)
         val sizeW = rect.width.coerceAtMost(width - left)
         val sizeH = rect.height.coerceAtMost(height - top)
-        val size = min(sizeW, sizeH)
-        if (size < 64) return BoardDetectionResult.NOT_FOUND
+        if (sizeW < 64 || sizeH < 64) {
+            return DetectionInternal(BoardDetectionResult.NOT_FOUND, 0f, "locked rect too small")
+        }
 
-        val ev = evaluateCandidate(pixels, width, height, left, top, size, checkSeams = true)
-        if (!ev.valid) return BoardDetectionResult.NOT_FOUND
+        val sqW = sizeW / 8f
+        val sqH = sizeH / 8f
+        val scratch = CandidateScratch()
+        var ei = 0
+        var oi = 0
+        for (r in 0..7) {
+            for (c in 0..7) {
+                sampleSquareCornerBg(pixels, width, height, left, top, sqW, sqH, r, c, scratch.tmpRgb)
+                if (((r + c) and 1) == 0) {
+                    scratch.evenR[ei] = scratch.tmpRgb[0]
+                    scratch.evenG[ei] = scratch.tmpRgb[1]
+                    scratch.evenB[ei] = scratch.tmpRgb[2]
+                    ei++
+                } else {
+                    scratch.oddR[oi] = scratch.tmpRgb[0]
+                    scratch.oddG[oi] = scratch.tmpRgb[1]
+                    scratch.oddB[oi] = scratch.tmpRgb[2]
+                    oi++
+                }
+            }
+        }
 
-        val evenLum = ev.evenRgb.luminance()
-        val oddLum = ev.oddRgb.luminance()
-        val lightRgb = if (evenLum >= oddLum) ev.evenRgb else ev.oddRgb
-        val darkRgb = if (evenLum >= oddLum) ev.oddRgb else ev.evenRgb
-        return BoardDetectionResult(
-            found = true,
-            rect = PixelRect(left, top, sizeW, sizeH),
-            confidence = ev.confidence.coerceIn(0f, 1f),
-            lightRgb = lightRgb,
-            darkRgb = darkRgb,
-            evenRgb = ev.evenRgb,
-            oddRgb = ev.oddRgb
+        val medER = median32(scratch.evenR)
+        val medEG = median32(scratch.evenG)
+        val medEB = median32(scratch.evenB)
+        val medOR = median32(scratch.oddR)
+        val medOG = median32(scratch.oddG)
+        val medOB = median32(scratch.oddB)
+        val sep = colorDist(medER, medEG, medEB, medOR, medOG, medOB)
+
+        if (sep < 12f) {
+            return DetectionInternal(
+                BoardDetectionResult.NOT_FOUND,
+                0f,
+                "locked rect low contrast (sep=${sep.roundToInt()})"
+            )
+        }
+
+        val evenRgb = Rgb(medER, medEG, medEB)
+        val oddRgb = Rgb(medOR, medOG, medOB)
+        val evenLum = evenRgb.luminance()
+        val oddLum = oddRgb.luminance()
+        val lightRgb = if (evenLum >= oddLum) evenRgb else oddRgb
+        val darkRgb = if (evenLum >= oddLum) oddRgb else evenRgb
+        val conf = (sep / 50f).coerceIn(0.35f, 1f)
+
+        return DetectionInternal(
+            result = BoardDetectionResult(
+                found = true,
+                rect = PixelRect(left, top, sizeW, sizeH),
+                confidence = conf,
+                lightRgb = lightRgb,
+                darkRgb = darkRgb,
+                evenRgb = evenRgb,
+                oddRgb = oddRgb
+            ),
+            bestScore = conf,
+            note = "manual align locked (sep=${sep.roundToInt()})"
         )
     }
 
@@ -292,72 +458,91 @@ object BoardVisionAnalyzer {
         left: Int,
         top: Int,
         size: Int,
-        checkSeams: Boolean
+        checkSeams: Boolean,
+        scratch: CandidateScratch
     ): CandidateEval {
         val sq = size / 8f
-        val evenR = IntArray(32)
-        val evenG = IntArray(32)
-        val evenB = IntArray(32)
-        val oddR = IntArray(32)
-        val oddG = IntArray(32)
-        val oddB = IntArray(32)
         var ei = 0
         var oi = 0
 
-        val tmpRgb = IntArray(3)
         for (r in 0..7) {
             for (c in 0..7) {
-                sampleSquareCornerBg(pixels, width, height, left, top, sq, sq, r, c, tmpRgb)
+                sampleSquareCornerBg(pixels, width, height, left, top, sq, sq, r, c, scratch.tmpRgb)
+                val idx = r * 8 + c
+                val mr = scratch.tmpRgb[0]
+                val mg = scratch.tmpRgb[1]
+                val mb = scratch.tmpRgb[2]
+                scratch.sqR[idx] = mr
+                scratch.sqG[idx] = mg
+                scratch.sqB[idx] = mb
                 if (((r + c) and 1) == 0) {
-                    evenR[ei] = tmpRgb[0]
-                    evenG[ei] = tmpRgb[1]
-                    evenB[ei] = tmpRgb[2]
+                    scratch.evenR[ei] = mr
+                    scratch.evenG[ei] = mg
+                    scratch.evenB[ei] = mb
                     ei++
                 } else {
-                    oddR[oi] = tmpRgb[0]
-                    oddG[oi] = tmpRgb[1]
-                    oddB[oi] = tmpRgb[2]
+                    scratch.oddR[oi] = mr
+                    scratch.oddG[oi] = mg
+                    scratch.oddB[oi] = mb
                     oi++
                 }
             }
         }
 
-        val medER = median32(evenR)
-        val medEG = median32(evenG)
-        val medEB = median32(evenB)
-        val medOR = median32(oddR)
-        val medOG = median32(oddG)
-        val medOB = median32(oddB)
+        val medER = median32(scratch.evenR)
+        val medEG = median32(scratch.evenG)
+        val medEB = median32(scratch.evenB)
+        val medOR = median32(scratch.oddR)
+        val medOG = median32(scratch.oddG)
+        val medOB = median32(scratch.oddB)
 
         val sep = colorDist(medER, medEG, medEB, medOR, medOG, medOB)
-        if (sep < 28f) {
+        if (sep < 18f) {
             return CandidateEval(
                 false, 0f, 0f, 0, 0, sep, 0f,
                 Rgb(medER, medEG, medEB), Rgb(medOR, medOG, medOB)
             )
         }
 
-        // Tolerance scales gently with board contrast (handles JPEG/scaling/theme gradients)
-        val tol = (sep * 0.24f).coerceIn(22f, 34f)
+        // Tolerance scales gently with board contrast (handles dark/slate, wood, green, blue & JPEG compression)
+        val tol = (sep * 0.30f).coerceIn(20f, 38f)
         var evenIn = 0
         var oddIn = 0
         var errSum = 0f
-        for (i in 0 until 32) {
-            val de = colorDist(evenR[i], evenG[i], evenB[i], medER, medEG, medEB)
-            if (de <= tol) {
-                evenIn++
-                errSum += de
-            }
-            val doDist = colorDist(oddR[i], oddG[i], oddB[i], medOR, medOG, medOB)
-            if (doDist <= tol) {
-                oddIn++
-                errSum += doDist
+
+        for (i in 0 until 8) {
+            scratch.rowEven[i] = 0
+            scratch.rowOdd[i] = 0
+            scratch.colEven[i] = 0
+            scratch.colOdd[i] = 0
+        }
+
+        for (r in 0..7) {
+            for (c in 0..7) {
+                val idx = r * 8 + c
+                if (((r + c) and 1) == 0) {
+                    val de = colorDist(scratch.sqR[idx], scratch.sqG[idx], scratch.sqB[idx], medER, medEG, medEB)
+                    if (de <= tol) {
+                        evenIn++
+                        errSum += de
+                        scratch.rowEven[r]++
+                        scratch.colEven[c]++
+                    }
+                } else {
+                    val doDist = colorDist(scratch.sqR[idx], scratch.sqG[idx], scratch.sqB[idx], medOR, medOG, medOB)
+                    if (doDist <= tol) {
+                        oddIn++
+                        errSum += doDist
+                        scratch.rowOdd[r]++
+                        scratch.colOdd[c]++
+                    }
+                }
             }
         }
 
         val totalIn = evenIn + oddIn
-        val minPerParity = if (checkSeams) 24 else 20
-        val minTotal = if (checkSeams) 52 else 44
+        val minPerParity = if (checkSeams) 18 else 16
+        val minTotal = if (checkSeams) 40 else 36
         if (evenIn < minPerParity || oddIn < minPerParity || totalIn < minTotal) {
             return CandidateEval(
                 false, 0f, 0f, evenIn, oddIn, sep, 0f,
@@ -365,26 +550,46 @@ object BoardVisionAnalyzer {
             )
         }
 
+        // Anti-1-row-shift boundary validation: outer rows (0 & 7) and outer cols (0 & 7)
+        // must each contain alternating light & dark board squares.
+        val borderRowsOk = (scratch.rowEven[0] >= 1 && scratch.rowOdd[0] >= 1) &&
+            (scratch.rowEven[7] >= 1 && scratch.rowOdd[7] >= 1)
+        val borderColsOk = (scratch.colEven[0] >= 1 && scratch.colOdd[0] >= 1) &&
+            (scratch.colEven[7] >= 1 && scratch.colOdd[7] >= 1)
+        var activeLines = 0
+        for (i in 0..7) {
+            if (scratch.rowEven[i] >= 1 && scratch.rowOdd[i] >= 1) activeLines++
+            if (scratch.colEven[i] >= 1 && scratch.colOdd[i] >= 1) activeLines++
+        }
+        var borderFactor = activeLines / 16f
+        borderFactor *= if (borderRowsOk && borderColsOk) 1.15f else 0.65f
+
         var seamRatio = 1f
+        var seamScore = 1f
+        var valid = true
         if (checkSeams) {
-            seamRatio = measureSeamSharpness(pixels, width, height, left, top, sq, sep)
-            if (seamRatio < 0.55f) {
-                return CandidateEval(
-                    false, 0f, 0f, evenIn, oddIn, sep, seamRatio,
-                    Rgb(medER, medEG, medEB), Rgb(medOR, medOG, medOB)
-                )
-            }
+            val sm = measureSeamSharpness(pixels, width, height, left, top, sq, sep)
+            seamRatio = sm.wideRatio
+            // Wide seam provides blur/compression resilience; tight seam sharpens alignment to ±1-2px
+            seamScore = 0.45f * sm.wideRatio + 0.55f * sm.tightRatio
+            valid = sm.wideRatio >= 0.35f &&
+                sm.vSeamsHit >= 6 &&
+                sm.hSeamsHit >= 6 &&
+                borderRowsOk &&
+                borderColsOk
         }
 
         val inlierFrac = totalIn / 64f
         val meanInlierErr = errSum / max(1, totalIn)
-        val tightness = (1f - (meanInlierErr / 40f)).coerceIn(0.2f, 1f)
-        val sepFactor = (sep / 90f).coerceIn(0.35f, 1.15f)
-        val score = inlierFrac * tightness * sepFactor * (0.55f + 0.45f * seamRatio)
-        val confidence = (inlierFrac * (sep / 70f).coerceAtMost(1f) * seamRatio).coerceIn(0f, 1f)
+        val tightness = (1f - (meanInlierErr / 42f)).coerceIn(0.2f, 1f)
+        val sepFactor = (sep / 80f).coerceIn(0.35f, 1.15f)
+        // Continuous score (no hard 0 cliff on seamRatio) so Stage 2 climbs smoothly to exact seams
+        val score = inlierFrac * tightness * sepFactor * borderFactor * (0.30f + 0.70f * seamScore)
+        val confidence = (inlierFrac * (sep / 50f).coerceAtMost(1f) * (seamRatio / 0.75f).coerceAtMost(1f))
+            .coerceIn(0f, 1f)
 
         return CandidateEval(
-            valid = true,
+            valid = valid,
             score = score,
             confidence = confidence,
             evenInliers = evenIn,
@@ -398,7 +603,8 @@ object BoardVisionAnalyzer {
 
     /**
      * Checks pixel contrast across the 7 internal vertical & 7 internal horizontal square boundaries
-     * using clean offsets near square corners (where pieces do not obscure seams).
+     * sampled at BOTH 0.16 and 0.84 along each seam segment so pieces & coordinate labels do not
+     * break seams. Tracks per-seam hit counts so non-board menus/cards never false-positive.
      */
     private fun measureSeamSharpness(
         pixels: IntArray,
@@ -408,41 +614,71 @@ object BoardVisionAnalyzer {
         top: Int,
         sq: Float,
         expectedSep: Float
-    ): Float {
-        val delta = max(2, (sq * 0.08f).roundToInt())
-        val minEdgeJump = expectedSep * 0.42f
-        var hits = 0
-        var total = 0
+    ): SeamMetrics {
+        val wideDelta = max(3, (sq * 0.07f).roundToInt())
+        val tightDelta = (sq * 0.03f).roundToInt().coerceIn(1, 2)
+        val minEdgeJump = max(8f, expectedSep * 0.38f)
 
-        // Vertical seams (between col c-1 and col c) sampled near top of each row (r + 0.14)
+        var wideHits = 0
+        var tightHits = 0
+        var total = 0
+        var vSeamsHit = 0
+        var hSeamsHit = 0
+
+        // Vertical seams (between col c-1 and col c) at 0.16 and 0.84 of each row
         for (c in 1..7) {
             val sx = (left + c * sq).roundToInt()
-            val xL = (sx - delta).coerceIn(0, width - 1)
-            val xR = (sx + delta).coerceIn(0, width - 1)
+            val xWL = (sx - wideDelta).coerceIn(0, width - 1)
+            val xWR = (sx + wideDelta).coerceIn(0, width - 1)
+            val xTL = (sx - tightDelta).coerceIn(0, width - 1)
+            val xTR = (sx + tightDelta).coerceIn(0, width - 1)
+            var seamHits = 0
             for (r in 0..7) {
-                val py = (top + (r + 0.14f) * sq).roundToInt().coerceIn(0, height - 1)
-                val p1 = pixels[py * width + xL]
-                val p2 = pixels[py * width + xR]
-                if (pixelDist(p1, p2) >= minEdgeJump) hits++
-                total++
+                for (k in 0..1) {
+                    val oy = if (k == 0) 0.16f else 0.84f
+                    val py = (top + (r + oy) * sq).roundToInt().coerceIn(0, height - 1)
+                    val rowOff = py * width
+                    if (pixelDist(pixels[rowOff + xWL], pixels[rowOff + xWR]) >= minEdgeJump) {
+                        wideHits++
+                        seamHits++
+                    }
+                    if (pixelDist(pixels[rowOff + xTL], pixels[rowOff + xTR]) >= minEdgeJump) {
+                        tightHits++
+                    }
+                    total++
+                }
             }
+            if (seamHits > 0) vSeamsHit++
         }
 
-        // Horizontal seams (between row r-1 and row r) sampled near right edge of each col (c + 0.86)
+        // Horizontal seams (between row r-1 and row r) at 0.16 and 0.84 of each col
         for (r in 1..7) {
             val sy = (top + r * sq).roundToInt()
-            val yU = (sy - delta).coerceIn(0, height - 1)
-            val yD = (sy + delta).coerceIn(0, height - 1)
+            val yWU = (sy - wideDelta).coerceIn(0, height - 1)
+            val yWD = (sy + wideDelta).coerceIn(0, height - 1)
+            val yTU = (sy - tightDelta).coerceIn(0, height - 1)
+            val yTD = (sy + tightDelta).coerceIn(0, height - 1)
+            var seamHits = 0
             for (c in 0..7) {
-                val px = (left + (c + 0.86f) * sq).roundToInt().coerceIn(0, width - 1)
-                val p1 = pixels[yU * width + px]
-                val p2 = pixels[yD * width + px]
-                if (pixelDist(p1, p2) >= minEdgeJump) hits++
-                total++
+                for (k in 0..1) {
+                    val ox = if (k == 0) 0.16f else 0.84f
+                    val px = (left + (c + ox) * sq).roundToInt().coerceIn(0, width - 1)
+                    if (pixelDist(pixels[yWU * width + px], pixels[yWD * width + px]) >= minEdgeJump) {
+                        wideHits++
+                        seamHits++
+                    }
+                    if (pixelDist(pixels[yTU * width + px], pixels[yTD * width + px]) >= minEdgeJump) {
+                        tightHits++
+                    }
+                    total++
+                }
             }
+            if (seamHits > 0) hSeamsHit++
         }
 
-        return if (total > 0) hits.toFloat() / total else 0f
+        val wRatio = if (total > 0) wideHits.toFloat() / total else 0f
+        val tRatio = if (total > 0) tightHits.toFloat() / total else 0f
+        return SeamMetrics(wRatio, tRatio, vSeamsHit, hSeamsHit)
     }
 
     /**
@@ -463,6 +699,13 @@ object BoardVisionAnalyzer {
         val sqH = rect.height / 8f
         val localBg = IntArray(3)
         val fgLums = IntArray(144)
+
+        val boardSep = colorDist(
+            detection.evenRgb.r, detection.evenRgb.g, detection.evenRgb.b,
+            detection.oddRgb.r, detection.oddRgb.g, detection.oddRgb.b
+        )
+        // Gently lower foreground distance threshold on low-contrast dark/slate themes
+        val fgDistThreshold = (boardSep * 0.65f).coerceIn(22f, 30f)
 
         for (r in 0..7) {
             for (c in 0..7) {
@@ -514,13 +757,13 @@ object BoardVisionAnalyzer {
                         }
                         validSamples++
 
-                        if (prevPx != -1 && pixelDist(prevPx, argb) >= 34f) {
+                        if (prevPx != -1 && pixelDist(prevPx, argb) >= 30f) {
                             edgeSteps++
                         }
                         prevPx = argb
 
                         val dist = colorDist(pr, pg, pb, bgR, bgG, bgB)
-                        if (dist > 30f) {
+                        if (dist > fgDistThreshold) {
                             val lum = (299 * pr + 587 * pg + 114 * pb) / 1000
                             fgLums[fgCount++] = lum
                             fgLumSum += lum
