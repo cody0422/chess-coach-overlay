@@ -1,8 +1,13 @@
 package com.chesscoach.overlay.vision
 
 import com.chesscoach.overlay.engine.ChessBoard
+import com.chesscoach.overlay.engine.Move
 import com.chesscoach.overlay.engine.Piece
 import com.chesscoach.overlay.engine.Squares
+import kotlin.math.cos
+import kotlin.math.hypot
+import kotlin.math.min
+import kotlin.math.sin
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
@@ -526,5 +531,247 @@ class BoardVisionAnalyzerTest {
             "Re-Detect",
             AutoReadStatusFormatter.actionButtonLabel(autoReadEnabled = false, hasMediaProjectionGrant = false)
         )
+
+        val blankStatus = AutoReadStatusFormatter.formatStatus(
+            autoReadEnabled = true,
+            autoReadLive = true,
+            hasMediaProjectionGrant = true,
+            boardVisibleOrLocked = false,
+            playingAsWhite = true,
+            fullMoveNumber = 1,
+            framesCaptured = 12L,
+            bestScore = 0f,
+            lastCaptureError = null,
+            tapInputMode = false,
+            frameMaxLum = 0
+        )
+        assertEquals(
+            "Auto-Read: Blank frames (12f) — tap Grant Access & pick Entire screen",
+            blankStatus
+        )
+    }
+
+    private fun drawCrispBlackArrow(
+        pixels: IntArray,
+        w: Int,
+        h: Int,
+        left: Int,
+        top: Int,
+        boardSize: Int,
+        arrow: Move,
+        playingAsWhite: Boolean
+    ) {
+        val sq = boardSize / 8f
+        fun sqCenter(sqIdx: Int): Pair<Float, Float> {
+            val file = Squares.fileOf(sqIdx)
+            val rank = Squares.rankOf(sqIdx)
+            val col = if (playingAsWhite) file else (7 - file)
+            val row = if (playingAsWhite) (7 - rank) else rank
+            return (left + (col + 0.5f) * sq) to (top + (row + 0.5f) * sq)
+        }
+        val (x1, y1) = sqCenter(arrow.from)
+        val (x2, y2) = sqCenter(arrow.to)
+        val dx = x2 - x1
+        val dy = y2 - y1
+        val dist = hypot(dx, dy)
+        if (dist < 1f) return
+        val cosA = dx / dist
+        val sinA = dy / dist
+        val tailX = x1 + cosA * (sq * 0.10f)
+        val tailY = y1 + sinA * (sq * 0.10f)
+        val tipX = x2 - cosA * (sq * 0.04f)
+        val tipY = y2 - sinA * (sq * 0.04f)
+        val headLen = min(sq * 0.28f, dist * 0.48f)
+        val baseX = tipX - cosA * headLen
+        val baseY = tipY - sinA * headLen
+        val shaftHalfW = sq * 0.065f
+        val headHalfW = sq * 0.20f
+        val outlinePad = 2.0f
+
+        val minY = (top).coerceIn(0, h - 1)
+        val maxY = (top + boardSize).coerceIn(0, h - 1)
+        val minX = (left).coerceIn(0, w - 1)
+        val maxX = (left + boardSize).coerceIn(0, w - 1)
+
+        val segDx = baseX - tailX
+        val segDy = baseY - tailY
+        val segLenSq = segDx * segDx + segDy * segDy
+
+        for (py in minY until maxY) {
+            val rowOff = py * w
+            for (px in minX until maxX) {
+                val fx = px.toFloat()
+                val fy = py.toFloat()
+                val t = if (segLenSq > 1e-4f) {
+                    (((fx - tailX) * segDx + (fy - tailY) * segDy) / segLenSq).coerceIn(0f, 1f)
+                } else 0f
+                val dShaft = hypot(fx - (tailX + t * segDx), fy - (tailY + t * segDy))
+
+                val rx = fx - baseX
+                val ry = fy - baseY
+                val u = rx * cosA + ry * sinA
+                val v = abs(-rx * sinA + ry * cosA)
+                val inHeadFill = u in 0f..headLen && v <= ((headLen - u) / headLen) * headHalfW
+                val inHeadOutline = u in -outlinePad..(headLen + outlinePad) &&
+                    v <= (((headLen - u).coerceIn(0f, headLen) / headLen) * headHalfW + outlinePad)
+
+                val inFill = dShaft <= shaftHalfW || inHeadFill
+                val inOutline = dShaft <= (shaftHalfW + outlinePad) || inHeadOutline
+                if (inFill) {
+                    pixels[rowOff + px] = rgb(11, 15, 20)
+                } else if (inOutline) {
+                    pixels[rowOff + px] = rgb(248, 250, 252)
+                }
+            }
+        }
+    }
+
+    @Test
+    fun texturedOceanBoardWithEdgeHandleAndRankDigitsClassifies64of64Clean() {
+        val board = ChessBoard()
+        val w = 540
+        val h = 1170
+        val boardSize = 540
+        val boardTop = 370
+        // Ocean theme colors matching Cody's real Samsung screenshot (light cream + blue wave)
+        val pixels = renderBoardScreen(
+            board = board,
+            playingAsWhite = true,
+            screenW = w,
+            screenH = h,
+            boardSize = boardSize,
+            boardTop = boardTop,
+            lightColor = rgb(250, 240, 230),
+            darkColor = rgb(78, 138, 170),
+            largePieces = true
+        )
+        val sq = boardSize / 8f
+        // Paint diagonal water-wave texture stripes on dark Ocean squares (deltas ~24 RGB)
+        for (r in 0..7) {
+            for (c in 0..7) {
+                if (((r + c) and 1) == 1) {
+                    val x0 = (c * sq).toInt()
+                    val y0 = boardTop + (r * sq).toInt()
+                    val x1 = ((c + 1) * sq).toInt()
+                    val y1 = boardTop + ((r + 1) * sq).toInt()
+                    for (py in y0 until y1) {
+                        val rowOff = py * w
+                        for (px in x0 until x1) {
+                            if (pixels[rowOff + px] == rgb(78, 138, 170) && ((px + py) / 9) % 2 == 0) {
+                                pixels[rowOff + px] = rgb(62, 122, 154)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // Paint Samsung Edge Panel dark grey handle along left border of a5 (r=3, c=0, x in 10..15)
+        fillRect(pixels, w, h, 9, boardTop + (2.75f * sq).toInt(), 15, boardTop + (3.85f * sq).toInt(), rgb(72, 82, 92))
+
+        val analysis = BoardVisionAnalyzer.analyzeFrame(pixels, w, h)
+        assertTrue("Ocean board must be detected", analysis.detection.found)
+        val grid = analysis.grid!!
+        val expected = BoardVisionAnalyzer.boardToScreenGrid(board, playingAsWhite = true)
+        assertEquals(64, BoardVisionAnalyzer.countGridMatches(grid, expected))
+
+        val start = BoardVisionAnalyzer.detectStartingPosition(grid)
+        assertTrue("Ocean starting position must match", start.isStartPosition)
+        assertTrue("Ocean orientation must detect playingAsWhite=true", start.playingAsWhite)
+    }
+
+    @Test
+    fun crispBlackArrowOnE2E4DoesNotCauseGhostPieceAndStillDetectsMovedPiece() {
+        val startBoard = ChessBoard()
+        val e2 = Squares.parse("e2")
+        val e4 = Squares.parse("e4")
+        val arrowMove = Move(e2, e4)
+
+        // Case 1: Empty e3 & e4 with sleek crisp black arrow drawn from e2 -> e4
+        val pixelsEmpty = renderBoardScreen(
+            board = startBoard,
+            playingAsWhite = true,
+            boardSize = 540,
+            boardTop = 340,
+            lightColor = rgb(250, 240, 230),
+            darkColor = rgb(78, 138, 170)
+        )
+        drawCrispBlackArrow(pixelsEmpty, 540, 1170, 0, 340, 540, arrowMove, playingAsWhite = true)
+
+        val analysisEmpty = BoardVisionAnalyzer.analyzeFrame(
+            pixels = pixelsEmpty,
+            width = 540,
+            height = 1170,
+            activeArrow = arrowMove,
+            activeArrowPlayingAsWhite = true
+        )
+        assertTrue(analysisEmpty.detection.found)
+        val gridEmpty = analysisEmpty.grid!!
+        // e3 = row 5, col 4; e4 = row 4, col 4
+        assertEquals("Empty e3 under black arrow must stay EMPTY", SquareOccupancy.EMPTY, gridEmpty[5 * 8 + 4])
+        assertEquals("Empty e4 under black arrow must stay EMPTY", SquareOccupancy.EMPTY, gridEmpty[4 * 8 + 4])
+        assertEquals("Starting e2 pawn must stay WHITE", SquareOccupancy.WHITE, gridEmpty[6 * 8 + 4])
+
+        // Case 2: White pawn actually moved onto e4 right under the exact same black arrow!
+        val afterE4 = ChessBoard()
+        val legalE4 = afterE4.generateLegalMoves().first { it.toUci() == "e2e4" }
+        afterE4.pushMove(legalE4)
+
+        val pixelsMoved = renderBoardScreen(
+            board = afterE4,
+            playingAsWhite = true,
+            boardSize = 540,
+            boardTop = 340,
+            lightColor = rgb(250, 240, 230),
+            darkColor = rgb(78, 138, 170)
+        )
+        drawCrispBlackArrow(pixelsMoved, 540, 1170, 0, 340, 540, arrowMove, playingAsWhite = true)
+
+        val analysisMoved = BoardVisionAnalyzer.analyzeFrame(
+            pixels = pixelsMoved,
+            width = 540,
+            height = 1170,
+            activeArrow = arrowMove,
+            activeArrowPlayingAsWhite = true
+        )
+        assertTrue(analysisMoved.detection.found)
+        val gridMoved = analysisMoved.grid!!
+        assertEquals("Vacated e2 must be EMPTY", SquareOccupancy.EMPTY, gridMoved[6 * 8 + 4])
+        assertEquals("Empty e3 under black arrow must stay EMPTY", SquareOccupancy.EMPTY, gridMoved[5 * 8 + 4])
+        assertEquals("Moved White pawn on e4 under black arrow must be WHITE", SquareOccupancy.WHITE, gridMoved[4 * 8 + 4])
+
+        // Legal move matcher must cleanly recognize 1. e4!
+        val match = BoardVisionAnalyzer.matchLegalMove(startBoard, gridMoved, playingAsWhite = true)
+        assertNotNull("Expected 1. e4 to match cleanly under active black arrow", match)
+        assertEquals("e2e4", match!!.moves.first().toUci())
+    }
+
+    @Test
+    fun automaticOrientationDetectionWorksAtStartAndMidOpeningForBothColors() {
+        // 1. Mid-opening game (after 1. e4 e5 2. Nf3) viewed from Black's perspective
+        val midBoard = ChessBoard()
+        for (uci in listOf("e2e4", "e7e5", "g1f3")) {
+            val m = midBoard.generateLegalMoves().first { it.toUci() == uci }
+            midBoard.pushMove(m)
+        }
+
+        val pixelsBlackBottom = renderBoardScreen(midBoard, playingAsWhite = false)
+        val analysisBlack = BoardVisionAnalyzer.analyzeFrame(pixelsBlackBottom, 540, 1170)
+        assertTrue(analysisBlack.detection.found)
+        assertEquals(false, BoardVisionAnalyzer.inferBoardOrientation(analysisBlack.grid!!))
+
+        // BoardTrackingSession starts assuming playingAsWhite=true, locks mid-opening -> auto-flips to Black!
+        val session = BoardTrackingSession()
+        val ev1 = session.onFrame(analysisBlack, ChessBoard(), currentPlayingAsWhite = true)
+        assertTrue(ev1.any { it is BoardTrackingEvent.BoardVisible })
+        val ev2 = session.onFrame(analysisBlack, ChessBoard(), currentPlayingAsWhite = true)
+        val orientEv = ev2.filterIsInstance<BoardTrackingEvent.OrientationDetected>().firstOrNull()
+        assertNotNull("Expected automatic OrientationDetected event", orientEv)
+        assertFalse("Expected playingAsWhite=false for Black at bottom", orientEv!!.playingAsWhite)
+
+        // 2. White at bottom mid-opening
+        val pixelsWhiteBottom = renderBoardScreen(midBoard, playingAsWhite = true)
+        val analysisWhite = BoardVisionAnalyzer.analyzeFrame(pixelsWhiteBottom, 540, 1170)
+        assertTrue(analysisWhite.detection.found)
+        assertEquals(true, BoardVisionAnalyzer.inferBoardOrientation(analysisWhite.grid!!))
     }
 }

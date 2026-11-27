@@ -27,7 +27,7 @@ jobs:
         with:
           gradle-version: 8.7
 
-      - name: Build Stockfish 17 for Android arm64-v8a (optional native engine)
+      - name: Build Stockfish 19 for Android arm64-v8a (optional native engine)
         id: build_stockfish
         continue-on-error: true
         shell: bash
@@ -49,16 +49,16 @@ jobs:
           fi
 
           rm -rf /tmp/Stockfish
-          if ! git clone --depth 1 --branch sf_17 https://github.com/official-stockfish/Stockfish.git /tmp/Stockfish; then
-            git clone --depth 1 https://github.com/official-stockfish/Stockfish.git /tmp/Stockfish
-          fi
+          git clone --depth 1 --branch sf_19 https://github.com/official-stockfish/Stockfish.git /tmp/Stockfish
 
           cd /tmp/Stockfish/src
           make net
 
-          SRCS=$(find . -name '*.cpp' ! -path './test*' | tr '\n' ' ')
-          echo "Compiling Stockfish sources with $CXX..."
-          "$CXX" -O3 -std=c++17 -DNDEBUG -DUSE_NEON=8 -DIS_64BIT             -fno-exceptions -pthread -static-libstdc++             -I. $SRCS -lm -o libstockfish.so
+          SRCS=$(find . -name '*.cpp' ! -path './test*' ! -path './universal*' | tr '\n' ' ')
+          echo "Compiling Stockfish 19 sources with $CXX..."
+          "$CXX" -O3 -std=c++17 -DNDEBUG -DUSE_NEON=8 -DUSE_POPCNT -DIS_64BIT -fPIE -pie \
+            -fno-exceptions -pthread -static-libstdc++ \
+            -I. $SRCS -lm -o libstockfish.so
 
           if [ -x "$STRIP" ]; then
             "$STRIP" --strip-unneeded libstockfish.so || true
@@ -92,15 +92,15 @@ jobs:
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v2.2.0
-          name: ChessCoachOverlay v2.2.0
+          tag_name: v2.3.0
+          name: ChessCoachOverlay v2.3.0
           body: |
-            ## ChessCoachOverlay v2.2.0
-            - **Android 14/15 MediaProjection Race Fix:** `OverlayService` now completes FGS upgrade (`specialUse|mediaProjection`), `getMediaProjection()`, `registerCallback()`, and `createVirtualDisplay()` synchronously while `MainActivity` is still foreground before launching Chess.com (fixes screen-capture revocation on Samsung One UI 7 / Android 15)
-            - **No More Zombie Overlays:** Switched `OverlayService` to `START_NOT_STICKY` so Android never resurrects an unpermitted overlay after app updates or background kills
-            - **1-Tap Grant Access in Settings & App:** When screen permission isn't active yet, Settings shows a green **Grant Access** button (and MainActivity shows **Grant Screen Permission & Open Chess.com**) that immediately launches the Android capture prompt and jumps straight back to your game
-            - **Real Error & Scan Telemetry:** Never swallows capture exceptions — Settings displays exact FGS / MediaProjection / VirtualDisplay error details or live scan progress (`Scanning (Xf · best Y%)`)
-            - **100% Offline Stockfish 17 ARM64 + Pure-Kotlin Fallback:** Adjustable **400–4000 Elo**, **50%–100% Accuracy**, **Depth 1–8**, **Play Styles (Default · Aggressive · Passive · Human)**, and **∞ Unlimited Moves/Day**
+            ## ChessCoachOverlay v2.3.0
+            - **Upgraded to Stockfish 19 (ARM64 NNUE):** Compiled directly from official `sf_19` with embedded NNUE network + pure-Kotlin fallback, adjustable **400–4000 Elo**, **50%–100% Accuracy**, **Depth 1–8**, and **∞ Unlimited Moves/Day**
+            - **Crisp Slim Black Best-Move Arrow:** Sleek black vector arrow (`#E60B0F14` with subtle crisp `#CCF8FAFC` outer outline) matching clean slim proportions that pops razor-sharp on both dark and light themes — with built-in arrow-corridor self-masking so auto-read never misreads the arrow as a piece
+            - **Fixed Pill Play/Pause Button:** Shows crisp white `||` while running (tap to pause) and muted grey `▶` while paused (tap to resume), with instant ON/PAUSED toast feedback
+            - **Textured Ocean Theme & Automatic White/Black Detection:** Tightened inner-square piece sampling (`0.25..0.75`) and theme-adaptive foreground thresholds for 64/64 clean classification on Ocean/wave/textured Chess.com themes, plus automatic White/Black orientation detection without ever needing to tap Flip
+            - **Smarter Telemetry & Auto-Hide Re-Detect:** Preserves pre-Settings scan telemetry while Settings is open, detects blank frames (`frameMaxLum < 12`), and auto-hides Settings on **Re-Detect** for instant board lock
           files: |
             ChessCoachOverlay.apk
           make_latest: true

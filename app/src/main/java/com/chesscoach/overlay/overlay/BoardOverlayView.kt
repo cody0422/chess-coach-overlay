@@ -234,7 +234,7 @@ class BoardOverlayView(context: Context) : View(context) {
         isFakeBoldText = true
     }
     private val arrowOutlinePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.argb(170, 15, 81, 50)
+        color = Color.parseColor("#CCF8FAFC")
         style = Paint.Style.STROKE
         strokeCap = Paint.Cap.ROUND
         strokeJoin = Paint.Join.ROUND
@@ -572,11 +572,11 @@ class BoardOverlayView(context: Context) : View(context) {
         val perpX = -sinA
         val perpY = cosA
 
-        // Clean Chess & Checkers Assistant / Chess.com translucent emerald vector arrow
+        // Sleek crisp black vector arrow matching reference proportions (with subtle light outer outline)
         val (arrowColor, shaftWidth, headLen, headHalfW) = when (rankIndex) {
-            0 -> Quad(Color.argb(212, 34, 197, 94), minSq * 0.20f, minSq * 0.44f, minSq * 0.32f)
-            1 -> Quad(Color.argb(148, 56, 189, 248), minSq * 0.14f, minSq * 0.34f, minSq * 0.24f)
-            else -> Quad(Color.argb(122, 251, 191, 36), minSq * 0.12f, minSq * 0.30f, minSq * 0.21f)
+            0 -> Quad(Color.parseColor("#E60B0F14"), minSq * 0.13f, minSq * 0.28f, minSq * 0.20f)
+            1 -> Quad(Color.argb(165, 30, 41, 59), minSq * 0.10f, minSq * 0.24f, minSq * 0.17f)
+            else -> Quad(Color.argb(135, 71, 85, 105), minSq * 0.09f, minSq * 0.21f, minSq * 0.15f)
         }
 
         val shaftHalfW = shaftWidth * 0.5f
@@ -611,13 +611,20 @@ class BoardOverlayView(context: Context) : View(context) {
             close()
         }
 
-        arrowFillPaint.color = arrowColor
-        canvas.drawPath(arrowPath, arrowFillPaint)
-
+        // Draw light outer outline first so the slim black shaft stays 100% razor-crisp inside
+        // while popping cleanly on both dark blue/slate/green and light cream/white squares.
         if (rankIndex == 0) {
-            arrowOutlinePaint.strokeWidth = 2.0f * density
+            arrowOutlinePaint.color = Color.parseColor("#CCF8FAFC")
+            arrowOutlinePaint.strokeWidth = 3.2f * density
+            canvas.drawPath(arrowPath, arrowOutlinePaint)
+        } else {
+            arrowOutlinePaint.color = Color.argb(140, 248, 250, 252)
+            arrowOutlinePaint.strokeWidth = 2.2f * density
             canvas.drawPath(arrowPath, arrowOutlinePaint)
         }
+
+        arrowFillPaint.color = arrowColor
+        canvas.drawPath(arrowPath, arrowFillPaint)
     }
 
     private data class Quad(val color: Int, val shaft: Float, val headLen: Float, val headHalfW: Float)

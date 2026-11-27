@@ -642,7 +642,7 @@
                 android:layout_height="wrap_content"
                 android:layout_marginTop="12dp"
                 android:gravity="center"
-                android:text="Engine: Stockfish 17 • ∞ Unlimited Moves"
+                android:text="Engine: Stockfish 19 • ∞ Unlimited Moves"
                 android:textColor="@color/text_muted"
                 android:textSize="11sp" />
 

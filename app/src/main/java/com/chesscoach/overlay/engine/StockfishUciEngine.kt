@@ -91,7 +91,7 @@ class StockfishUciEngine(private val context: Context) {
             }
 
             initialized = true
-            activeEngineName = "Stockfish 17"
+            activeEngineName = "Stockfish 19"
             true
         } catch (_: Throwable) {
             destroyProcessLocked()
@@ -292,7 +292,7 @@ class StockfishUciEngine(private val context: Context) {
                     whiteMateIn = whiteMateIn,
                     depth = highestDepth.coerceAtLeast(1),
                     nodes = lastNodes,
-                    engineName = "Stockfish 17"
+                    engineName = "Stockfish 19"
                 )
             } catch (_: Throwable) {
                 searching.set(false)

@@ -82,6 +82,8 @@ class OverlayService : Service() {
     private var lastFramesCaptured: Long = 0L
     private var lastDetectionBestScore: Float = 0f
     private var lastDetectionNote: String = ""
+    private var lastFrameMinLum: Int = -1
+    private var lastFrameMaxLum: Int = -1
     private var lastCaptureError: String? = null
 
     private var boardView: BoardOverlayView? = null
@@ -313,6 +315,8 @@ class OverlayService : Service() {
         lastFramesCaptured = 0L
         lastDetectionBestScore = 0f
         lastDetectionNote = ""
+        lastFrameMinLum = -1
+        lastFrameMaxLum = -1
         lastCaptureError = null
 
         var readerRef: ScreenBoardReader? = null
@@ -374,6 +378,8 @@ class OverlayService : Service() {
         lastFramesCaptured = 0L
         lastDetectionBestScore = 0f
         lastDetectionNote = ""
+        lastFrameMinLum = -1
+        lastFrameMaxLum = -1
         trackingSession.resetTracking()
     }
 
@@ -385,13 +391,18 @@ class OverlayService : Service() {
         if (!isAutoReadLive()) return
 
         lastFramesCaptured = analysis.framesCaptured
-        lastDetectionBestScore = analysis.lastBestScore
-        lastDetectionNote = analysis.lastDetectionNote
 
+        // Preserve pre-Settings detection telemetry & luma while the dark Settings modal covers the board
         if (settingsAttached) {
             settingsController?.updateScreenReadStatus(describeScreenReadStatus())
             return
         }
+
+        lastDetectionBestScore = analysis.lastBestScore
+        lastDetectionNote = analysis.lastDetectionNote
+        lastFrameMinLum = analysis.frameMinLum
+        lastFrameMaxLum = analysis.frameMaxLum
+
         // Don't fight the user while dragging/resizing in Align mode
         if (currentMode == OverlayMode.ALIGN) return
 
@@ -421,6 +432,17 @@ class OverlayService : Service() {
                     if (lastAnalysis == null || justBecameVisible) {
                         triggerAnalysis()
                     }
+                }
+                is BoardTrackingEvent.OrientationDetected -> {
+                    autoBoardDetectedVisible = true
+                    if (!manualAlignLocked) {
+                        snapBoardOverlayToRect(ev.rect)
+                    }
+                    prefs.playingAsWhite = ev.playingAsWhite
+                    applyPrefsToViews()
+                    updateBoardVisibility()
+                    updatePillVisualState()
+                    refreshBoardView(analyzing = false)
                 }
                 is BoardTrackingEvent.NewGameDetected -> {
                     autoBoardDetectedVisible = true
@@ -501,6 +523,17 @@ class OverlayService : Service() {
         )
     }
 
+    private fun syncActiveArrowMask() {
+        val reader = screenBoardReader ?: return
+        val arrowVisible = overlayArrowsActive &&
+            prefs.showArrows &&
+            currentMode != OverlayMode.ALIGN &&
+            !settingsAttached &&
+            (autoBoardDetectedVisible || manualAlignLocked || !isAutoReadLive())
+        reader.activeArrow = if (arrowVisible) lastAnalysis?.topMoves?.firstOrNull()?.move else null
+        reader.activeArrowPlayingAsWhite = prefs.playingAsWhite
+    }
+
     private fun updateBoardVisibility() {
         val bv = boardView ?: return
         val shouldShow = when {
@@ -513,6 +546,7 @@ class OverlayService : Service() {
         if (bv.visibility != targetVis) {
             bv.visibility = targetVis
         }
+        syncActiveArrowMask()
     }
 
     private fun defaultBoardRect(): BoardRect {
@@ -685,6 +719,11 @@ class OverlayService : Service() {
             overlayArrowsActive = !overlayArrowsActive
             updateBoardVisibility()
             updatePillVisualState()
+            Toast.makeText(
+                this,
+                if (overlayArrowsActive) "Arrows ON" else "Arrows PAUSED",
+                Toast.LENGTH_SHORT
+            ).show()
             if (overlayArrowsActive) {
                 triggerAnalysis()
             }
@@ -766,11 +805,13 @@ class OverlayService : Service() {
         val playIcon = ivPillPlay
         if (playIcon != null) {
             if (overlayArrowsActive) {
-                playIcon.setImageResource(R.drawable.ic_play)
-                playIcon.setColorFilter(Color.parseColor("#22C55E"))
-            } else {
+                // RUNNING / ARROWS ON: crisp white || (tap to pause), matching reference pill
                 playIcon.setImageResource(R.drawable.ic_pause)
-                playIcon.setColorFilter(Color.parseColor("#64748B"))
+                playIcon.setColorFilter(Color.parseColor("#F8FAFC"))
+            } else {
+                // PAUSED / ARROWS OFF: muted grey ▶ (tap to resume)
+                playIcon.setImageResource(R.drawable.ic_play)
+                playIcon.setColorFilter(Color.parseColor("#94A3B8"))
             }
         }
 
@@ -802,11 +843,14 @@ class OverlayService : Service() {
             framesCaptured = lastFramesCaptured,
             bestScore = lastDetectionBestScore,
             lastCaptureError = lastCaptureError,
-            tapInputMode = prefs.tapInputMode
+            tapInputMode = prefs.tapInputMode,
+            frameMaxLum = lastFrameMaxLum
         )
     }
 
     private fun launchGrantScreenPermissionActivity() {
+        overlayArrowsActive = true
+        updatePillVisualState()
         hideSettingsModal()
         Toast.makeText(
             this,
@@ -860,7 +904,10 @@ class OverlayService : Service() {
             onTapInputToggled = { tapEnabled ->
                 setOverlayMode(if (tapEnabled) OverlayMode.TAP_MOVE else OverlayMode.PASS_THROUGH)
             },
-            onAlignClicked = { setOverlayMode(OverlayMode.ALIGN) },
+            onAlignClicked = {
+                overlayArrowsActive = true
+                setOverlayMode(OverlayMode.ALIGN)
+            },
             onFlipClicked = {
                 prefs.playingAsWhite = !prefs.playingAsWhite
                 applyPrefsToViews()
@@ -874,6 +921,7 @@ class OverlayService : Service() {
             },
             onNewGameClicked = { resetGame() },
             onRedetectClicked = {
+                overlayArrowsActive = true
                 if (prefs.autoReadScreen && !hasMediaProjectionGrant) {
                     launchGrantScreenPermissionActivity()
                 } else {
@@ -881,6 +929,7 @@ class OverlayService : Service() {
                     screenBoardReader?.lockedScreenRect = null
                     trackingSession.resetTracking()
                     autoBoardDetectedVisible = false
+                    hideSettingsModal()
                     updateBoardVisibility()
                     updatePillVisualState()
                     Toast.makeText(this, "Scanning for board…", Toast.LENGTH_SHORT).show()
@@ -1024,6 +1073,7 @@ class OverlayService : Service() {
             analyzing = analyzing,
             risks = risks
         )
+        syncActiveArrowMask()
     }
 
     override fun onDestroy() {

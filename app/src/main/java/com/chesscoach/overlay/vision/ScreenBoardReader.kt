@@ -14,7 +14,9 @@ import android.os.HandlerThread
 import android.os.Looper
 import android.util.DisplayMetrics
 import android.view.WindowManager
+import com.chesscoach.overlay.engine.Move
 import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.math.max
 import kotlin.math.min
 
 /**
@@ -56,9 +58,17 @@ class ScreenBoardReader(
     private var latestHeight: Int = 0
     private var hasLatestFrame: Boolean = false
     private var framesCaptured: Long = 0L
+    private var latestFrameMinLum: Int = -1
+    private var latestFrameMaxLum: Int = -1
 
     @Volatile
     var lockedScreenRect: PixelRect? = null
+
+    @Volatile
+    var activeArrow: Move? = null
+
+    @Volatile
+    var activeArrowPlayingAsWhite: Boolean = true
 
     @Volatile
     var lastError: String? = null
@@ -128,6 +138,8 @@ class ScreenBoardReader(
         latestHeight = 0
         hasLatestFrame = false
         framesCaptured = 0L
+        latestFrameMinLum = -1
+        latestFrameMaxLum = -1
 
         val thread = HandlerThread("ScreenBoardReader").apply { start() }
         val handler = Handler(thread.looper)
@@ -225,6 +237,8 @@ class ScreenBoardReader(
         framesCaptured = 0L
         latestWidth = 0
         latestHeight = 0
+        latestFrameMinLum = -1
+        latestFrameMaxLum = -1
     }
 
     private fun drainLatestImageIntoBuffer(reader: ImageReader): Boolean {
@@ -261,6 +275,27 @@ class ScreenBoardReader(
                     latestPixels[outIdx++] = (0xFF shl 24) or (r shl 16) or (g shl 8) or b
                 }
             }
+
+            // Fast 16x16 luma sample (<0.1ms) to detect black/blank OS capture frames
+            var minLum = 255
+            var maxLum = 0
+            val gridN = 16
+            for (gy in 0 until gridN) {
+                val sy = ((gy + 0.5f) * imgH / gridN).toInt().coerceIn(0, imgH - 1)
+                val rowOff = sy * imgW
+                for (gx in 0 until gridN) {
+                    val sx = ((gx + 0.5f) * imgW / gridN).toInt().coerceIn(0, imgW - 1)
+                    val p = latestPixels[rowOff + sx]
+                    val pr = (p ushr 16) and 0xFF
+                    val pg = (p ushr 8) and 0xFF
+                    val pb = p and 0xFF
+                    val lum = (299 * pr + 587 * pg + 114 * pb) / 1000
+                    if (lum < minLum) minLum = lum
+                    if (lum > maxLum) maxLum = lum
+                }
+            }
+            latestFrameMinLum = minLum
+            latestFrameMaxLum = maxLum
 
             latestWidth = imgW
             latestHeight = imgH
@@ -315,7 +350,14 @@ class ScreenBoardReader(
             )
         }
 
-        val raw = BoardVisionAnalyzer.analyzeFrame(latestPixels, imgW, imgH, lockedCapRect)
+        val raw = BoardVisionAnalyzer.analyzeFrame(
+            pixels = latestPixels,
+            width = imgW,
+            height = imgH,
+            lockedRect = lockedCapRect,
+            activeArrow = activeArrow,
+            activeArrowPlayingAsWhite = activeArrowPlayingAsWhite
+        )
         val scaledDetection = if (raw.detection.found) {
             raw.detection.copy(rect = raw.detection.rect.scaled(scaleToScreenX, scaleToScreenY))
         } else {
@@ -326,7 +368,9 @@ class ScreenBoardReader(
             grid = raw.grid,
             framesCaptured = framesCaptured,
             lastBestScore = raw.lastBestScore,
-            lastDetectionNote = raw.lastDetectionNote
+            lastDetectionNote = raw.lastDetectionNote,
+            frameMinLum = latestFrameMinLum,
+            frameMaxLum = latestFrameMaxLum
         )
 
         if (running.get()) {

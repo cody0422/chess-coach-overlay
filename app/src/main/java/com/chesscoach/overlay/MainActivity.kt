@@ -156,7 +156,7 @@ class MainActivity : AppCompatActivity() {
 
         val hasStockfish = StockfishUciEngine(this).hasBinary()
         tvEngineStatus.text = if (hasStockfish) {
-            "Engine: Stockfish 17 (ARM64) + Pure-Kotlin Fallback • ∞ Moves/Day"
+            "Engine: Stockfish 19 (ARM64) + Pure-Kotlin Fallback • ∞ Moves/Day"
         } else {
             "Engine: Offline Pure-Kotlin Chess Engine • ∞ Moves/Day"
         }

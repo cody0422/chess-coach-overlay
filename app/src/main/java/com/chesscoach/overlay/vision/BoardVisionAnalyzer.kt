@@ -73,7 +73,9 @@ data class FrameAnalysis(
     val grid: Array<SquareOccupancy>?,
     val framesCaptured: Long = 0L,
     val lastBestScore: Float = detection.confidence,
-    val lastDetectionNote: String = ""
+    val lastDetectionNote: String = "",
+    val frameMinLum: Int = -1,
+    val frameMaxLum: Int = -1
 ) {
     override fun equals(other: Any?): Boolean {
         if (this === other) return true
@@ -82,7 +84,9 @@ data class FrameAnalysis(
             grid.contentEquals(other.grid) &&
             framesCaptured == other.framesCaptured &&
             lastBestScore == other.lastBestScore &&
-            lastDetectionNote == other.lastDetectionNote
+            lastDetectionNote == other.lastDetectionNote &&
+            frameMinLum == other.frameMinLum &&
+            frameMaxLum == other.frameMaxLum
     }
 
     override fun hashCode(): Int {
@@ -91,6 +95,8 @@ data class FrameAnalysis(
         result = 31 * result + framesCaptured.hashCode()
         result = 31 * result + lastBestScore.hashCode()
         result = 31 * result + lastDetectionNote.hashCode()
+        result = 31 * result + frameMinLum
+        result = 31 * result + frameMaxLum
         return result
     }
 }
@@ -105,7 +111,7 @@ object BoardVisionAnalyzer {
     // AND well outside tapered piece crowns/bases and corner rank/file coordinate letters.
     private val CORNER_OX = floatArrayOf(0.15f, 0.85f, 0.15f, 0.85f)
     private val CORNER_OY = floatArrayOf(0.15f, 0.15f, 0.85f, 0.85f)
-    private val CANDIDATE_WIDTH_FRACS = floatArrayOf(1.00f, 0.98f, 0.95f, 0.92f, 0.88f, 0.84f, 0.80f)
+    private val CANDIDATE_WIDTH_FRACS = floatArrayOf(1.00f, 0.98f, 0.95f, 0.92f, 0.88f, 0.84f, 0.80f, 0.75f, 0.70f)
 
     private data class CandidateEval(
         val valid: Boolean,
@@ -160,7 +166,9 @@ object BoardVisionAnalyzer {
         pixels: IntArray,
         width: Int,
         height: Int,
-        lockedRect: PixelRect? = null
+        lockedRect: PixelRect? = null,
+        activeArrow: Move? = null,
+        activeArrowPlayingAsWhite: Boolean = true
     ): FrameAnalysis {
         if (width < 64 || height < 64 || pixels.size < width * height) {
             return FrameAnalysis(
@@ -184,7 +192,14 @@ object BoardVisionAnalyzer {
                 lastDetectionNote = detInternal.note
             )
         }
-        val grid = classifyGrid(pixels, width, height, detection)
+        val grid = classifyGrid(
+            pixels = pixels,
+            width = width,
+            height = height,
+            detection = detection,
+            activeArrow = activeArrow,
+            activeArrowPlayingAsWhite = activeArrowPlayingAsWhite
+        )
         return FrameAnalysis(
             detection = detection,
             grid = grid,
@@ -209,7 +224,7 @@ object BoardVisionAnalyzer {
         val scratch = CandidateScratch()
         val minDim = min(width, height)
         val yMin = (height * 0.05f).toInt().coerceAtLeast(0)
-        val yMaxTotal = (height * 0.92f).toInt().coerceAtMost(height)
+        val yMaxTotal = (height * 0.96f).toInt().coerceAtMost(height)
 
         var bestCoarseScore = 0f
         val peaks = ArrayList<CoarsePeak>(8)
@@ -685,11 +700,97 @@ object BoardVisionAnalyzer {
      * Classifies all 64 squares in screen order (row 0 = top .. row 7 = bottom,
      * col 0 = left .. col 7 = right) as EMPTY, WHITE, or BLACK.
      */
+    private class ArrowMaskGeometry(
+        val tailX: Float,
+        val tailY: Float,
+        val baseX: Float,
+        val baseY: Float,
+        val cosA: Float,
+        val sinA: Float,
+        val headLen: Float,
+        val shaftRadius: Float,
+        val headHalfW: Float,
+        val headPad: Float
+    ) {
+        fun contains(px: Float, py: Float): Boolean {
+            // Distance to arrow shaft segment (tail -> base)
+            val dx = baseX - tailX
+            val dy = baseY - tailY
+            val lenSq = dx * dx + dy * dy
+            val segDist = if (lenSq < 1e-4f) {
+                sqrt((px - tailX) * (px - tailX) + (py - tailY) * (py - tailY))
+            } else {
+                val t = (((px - tailX) * dx + (py - tailY) * dy) / lenSq).coerceIn(0f, 1f)
+                val cx = tailX + t * dx
+                val cy = tailY + t * dy
+                sqrt((px - cx) * (px - cx) + (py - cy) * (py - cy))
+            }
+            if (segDist <= shaftRadius) return true
+
+            // Arrowhead triangle in local (u along arrow from base to tip, v perpendicular)
+            val rx = px - baseX
+            val ry = py - baseY
+            val u = rx * cosA + ry * sinA
+            if (u >= -headPad && u <= headLen + headPad) {
+                val v = abs(-rx * sinA + ry * cosA)
+                val frac = ((headLen - u) / max(1f, headLen)).coerceIn(0f, 1f)
+                if (v <= frac * headHalfW + headPad) return true
+            }
+            return false
+        }
+    }
+
+    private fun buildArrowMaskGeometry(
+        rect: PixelRect,
+        sqW: Float,
+        sqH: Float,
+        arrow: Move,
+        playingAsWhite: Boolean
+    ): ArrowMaskGeometry? {
+        fun sqCenter(sqIdx: Int): Pair<Float, Float> {
+            val file = Squares.fileOf(sqIdx)
+            val rank = Squares.rankOf(sqIdx)
+            val col = if (playingAsWhite) file else (7 - file)
+            val row = if (playingAsWhite) (7 - rank) else rank
+            return (rect.left + (col + 0.5f) * sqW) to (rect.top + (row + 0.5f) * sqH)
+        }
+        val (x1, y1) = sqCenter(arrow.from)
+        val (x2, y2) = sqCenter(arrow.to)
+        val dx = x2 - x1
+        val dy = y2 - y1
+        val dist = sqrt(dx * dx + dy * dy)
+        if (dist < 1f) return null
+        val minSq = min(sqW, sqH)
+        val cosA = dx / dist
+        val sinA = dy / dist
+        val tailX = x1 + cosA * (minSq * 0.10f)
+        val tailY = y1 + sinA * (minSq * 0.10f)
+        val tipX = x2 - cosA * (minSq * 0.04f)
+        val tipY = y2 - sinA * (minSq * 0.04f)
+        val headLen = min(minSq * 0.28f, dist * 0.48f)
+        val baseX = tipX - cosA * headLen
+        val baseY = tipY - sinA * headLen
+        return ArrowMaskGeometry(
+            tailX = tailX,
+            tailY = tailY,
+            baseX = baseX,
+            baseY = baseY,
+            cosA = cosA,
+            sinA = sinA,
+            headLen = headLen,
+            shaftRadius = minSq * 0.12f,
+            headHalfW = minSq * 0.20f,
+            headPad = minSq * 0.04f
+        )
+    }
+
     fun classifyGrid(
         pixels: IntArray,
         width: Int,
         height: Int,
-        detection: BoardDetectionResult
+        detection: BoardDetectionResult,
+        activeArrow: Move? = null,
+        activeArrowPlayingAsWhite: Boolean = true
     ): Array<SquareOccupancy> {
         val grid = Array(64) { SquareOccupancy.EMPTY }
         val rect = detection.rect
@@ -700,12 +801,18 @@ object BoardVisionAnalyzer {
         val localBg = IntArray(3)
         val fgLums = IntArray(144)
 
+        val arrowMask = if (activeArrow != null) {
+            buildArrowMaskGeometry(rect, sqW, sqH, activeArrow, activeArrowPlayingAsWhite)
+        } else {
+            null
+        }
+
         val boardSep = colorDist(
             detection.evenRgb.r, detection.evenRgb.g, detection.evenRgb.b,
             detection.oddRgb.r, detection.oddRgb.g, detection.oddRgb.b
         )
-        // Gently lower foreground distance threshold on low-contrast dark/slate themes
-        val fgDistThreshold = (boardSep * 0.60f).coerceIn(18f, 30f)
+        // Scale foreground distance threshold cleanly across low-contrast slate & textured Ocean themes
+        val fgDistThreshold = (boardSep * 0.28f).coerceIn(22f, 44f)
 
         for (r in 0..7) {
             for (c in 0..7) {
@@ -734,10 +841,12 @@ object BoardVisionAnalyzer {
                 var darkFg = 0
                 var edgeSteps = 0
 
-                val startX = rect.left + (c + 0.21f) * sqW
-                val spanX = 0.58f * sqW
-                val startY = rect.top + (r + 0.21f) * sqH
-                val spanY = 0.58f * sqH
+                // Sample inner 0.25..0.75 box so rank/file coordinates and Samsung Edge Panel handles
+                // along outer square borders NEVER cause false piece detections!
+                val startX = rect.left + (c + 0.25f) * sqW
+                val spanX = 0.50f * sqW
+                val startY = rect.top + (r + 0.25f) * sqH
+                val spanY = 0.50f * sqH
 
                 for (sy in 0 until samples) {
                     val py = (startY + (sy + 0.5f) * spanY / samples)
@@ -747,12 +856,17 @@ object BoardVisionAnalyzer {
                     for (sx in 0 until samples) {
                         val px = (startX + (sx + 0.5f) * spanX / samples)
                             .roundToInt().coerceIn(0, width - 1)
+                        if (arrowMask != null && arrowMask.contains(px.toFloat(), py.toFloat())) {
+                            prevPx = -1
+                            continue
+                        }
                         val argb = pixels[rowOff + px]
                         val pr = (argb ushr 16) and 0xFF
                         val pg = (argb ushr 8) and 0xFF
                         val pb = argb and 0xFF
 
                         if (isOverlayAnnotationPixel(pr, pg, pb, bgR, bgG, bgB)) {
+                            prevPx = -1
                             continue
                         }
                         validSamples++
@@ -779,16 +893,16 @@ object BoardVisionAnalyzer {
                 }
 
                 val fgFrac = fgCount.toFloat() / validSamples.toFloat()
-                // Reject flat tinted empty squares (pieces always have internal luminance/edge structure)
-                val hasPieceStructure = edgeSteps >= 4 || fgFrac >= 0.24f
-                if (fgFrac >= 0.10f && hasPieceStructure && fgCount >= 8) {
+                // Reject flat/textured empty squares (real pieces have dense fg coverage + internal edges)
+                val hasPieceStructure = edgeSteps >= 5 || fgFrac >= 0.26f
+                if (fgFrac >= 0.13f && hasPieceStructure && fgCount >= 8) {
                     fgLums.sort(0, fgCount)
                     val meanLum = fgLumSum.toFloat() / fgCount.toFloat()
                     val p75Lum = fgLums[(fgCount * 3) / 4].toFloat()
                     val brightFrac = brightFg.toFloat() / fgCount.toFloat()
                     val darkFrac = darkFg.toFloat() / fgCount.toFloat()
 
-                    val isWhite = (p75Lum >= 165f) ||
+                    val isWhite = (p75Lum >= 170f && darkFrac < 0.45f) ||
                         (meanLum >= 145f) ||
                         (brightFrac >= 0.35f && darkFrac < 0.45f)
 
@@ -832,17 +946,47 @@ object BoardVisionAnalyzer {
             }
         }
 
-        // Require zero pieces in middle 4 ranks so opening moves (1. e4, 1. Nf3, etc.)
-        // are NEVER misread as the starting position.
-        if (midOccupied == 0) {
-            if (topBlack >= 15 && botWhite >= 15) {
+        // Allow up to 1 stray mid-rank artifact on heavily textured themes while still requiring
+        // near-full starting back two ranks on both sides (opening moves vacate a rank 2/7 square).
+        if (midOccupied <= 1) {
+            val whiteStart = topBlack >= 14 && botWhite >= 14 && (midOccupied == 0 || (topBlack >= 15 && botWhite >= 16) || (topBlack >= 16 && botWhite >= 15))
+            if (whiteStart) {
                 return StartPositionDetection(isStartPosition = true, playingAsWhite = true)
             }
-            if (topWhite >= 15 && botBlack >= 15) {
+            val blackStart = topWhite >= 14 && botBlack >= 14 && (midOccupied == 0 || (topWhite >= 15 && botBlack >= 16) || (topWhite >= 16 && botBlack >= 15))
+            if (blackStart) {
                 return StartPositionDetection(isStartPosition = true, playingAsWhite = false)
             }
         }
         return StartPositionDetection(isStartPosition = false, playingAsWhite = true)
+    }
+
+    /**
+     * Infers board orientation (playingAsWhite = true when White pieces occupy the bottom two
+     * ranks, false when Black pieces occupy the bottom two ranks) even when a game is already
+     * 1-6 moves in so the user never has to manually pick their color.
+     */
+    fun inferBoardOrientation(screenGrid: Array<SquareOccupancy>): Boolean? {
+        if (screenGrid.size != 64) return null
+        var topWhite = 0
+        var topBlack = 0
+        var botWhite = 0
+        var botBlack = 0
+        for (r in 0..7) {
+            for (c in 0..7) {
+                val occ = screenGrid[r * 8 + c]
+                if (r == 0 || r == 1) {
+                    if (occ == SquareOccupancy.WHITE) topWhite++
+                    else if (occ == SquareOccupancy.BLACK) topBlack++
+                } else if (r == 6 || r == 7) {
+                    if (occ == SquareOccupancy.WHITE) botWhite++
+                    else if (occ == SquareOccupancy.BLACK) botBlack++
+                }
+            }
+        }
+        if (topBlack >= 11 && botWhite >= 11 && topWhite <= 2 && botBlack <= 2) return true
+        if (topWhite >= 11 && botBlack >= 11 && topBlack <= 2 && botWhite <= 2) return false
+        return null
     }
 
     /**
@@ -1085,6 +1229,7 @@ object BoardVisionAnalyzer {
 sealed class BoardTrackingEvent {
     data object BoardHidden : BoardTrackingEvent()
     data class BoardVisible(val rect: PixelRect, val confidence: Float) : BoardTrackingEvent()
+    data class OrientationDetected(val playingAsWhite: Boolean, val rect: PixelRect) : BoardTrackingEvent()
     data class NewGameDetected(val playingAsWhite: Boolean, val rect: PixelRect) : BoardTrackingEvent()
     data class MovesDetected(val moves: List<Move>, val rect: PixelRect) : BoardTrackingEvent()
 }
@@ -1174,10 +1319,20 @@ class BoardTrackingSession {
             return events
         }
 
+        // First board lock mid-opening (e.g. 1-6 moves already played): automatically detect
+        // White vs Black orientation so the user never has to tap Flip manually!
+        var effectivePlayingAsWhite = currentPlayingAsWhite
+        if (!hasInitializedGame) {
+            val inferred = BoardVisionAnalyzer.inferBoardOrientation(grid)
+            if (inferred != null && inferred != currentPlayingAsWhite) {
+                effectivePlayingAsWhite = inferred
+                events.add(BoardTrackingEvent.OrientationDetected(inferred, rect))
+            }
+        }
         hasInitializedGame = true
 
         // Match legal 1-ply (or 2-ply) move from currentBoard
-        val match = BoardVisionAnalyzer.matchLegalMove(currentBoard, grid, currentPlayingAsWhite)
+        val match = BoardVisionAnalyzer.matchLegalMove(currentBoard, grid, effectivePlayingAsWhite)
         if (match != null && match.moves.isNotEmpty()) {
             // Reset stability counter so we don't double-fire on the same move before board updates
             pendingStableCount = 0
@@ -1203,7 +1358,8 @@ object AutoReadStatusFormatter {
         framesCaptured: Long,
         bestScore: Float,
         lastCaptureError: String?,
-        tapInputMode: Boolean
+        tapInputMode: Boolean,
+        frameMaxLum: Int = -1
     ): String {
         return when {
             autoReadLive && boardVisibleOrLocked -> {
@@ -1212,6 +1368,8 @@ object AutoReadStatusFormatter {
             }
             autoReadLive && framesCaptured == 0L ->
                 "Auto-Read: Waiting for screen frames..."
+            autoReadLive && frameMaxLum in 0..11 ->
+                "Auto-Read: Blank frames (${framesCaptured}f) — tap Grant Access & pick Entire screen"
             autoReadLive -> {
                 val bestPct = (bestScore * 100f).toInt().coerceIn(0, 100)
                 "Auto-Read: Scanning (${framesCaptured}f · best $bestPct%) — open a game"
