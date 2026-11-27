@@ -774,4 +774,91 @@ class BoardVisionAnalyzerTest {
         assertTrue(analysisWhite.detection.found)
         assertEquals(true, BoardVisionAnalyzer.inferBoardOrientation(analysisWhite.grid!!))
     }
+
+    @Test
+    fun singleFrameMoveConfirmationWorksInAccessibilityModeWhileCastRequiresTwoFrames() {
+        val startBoard = ChessBoard()
+        val afterE4 = ChessBoard()
+        val e2e4 = afterE4.generateLegalMoves().first { it.toUci() == "e2e4" }
+        afterE4.pushMove(e2e4)
+
+        val startPixels = renderBoardScreen(startBoard, playingAsWhite = true)
+        val startAnalysis = BoardVisionAnalyzer.analyzeFrame(startPixels, 540, 1170)
+        assertTrue(startAnalysis.detection.found)
+
+        val e4Pixels = renderBoardScreen(afterE4, playingAsWhite = true)
+        val e4Analysis = BoardVisionAnalyzer.analyzeFrame(e4Pixels, 540, 1170)
+        assertTrue(e4Analysis.detection.found)
+
+        // 1. Accessibility mode (singleFrameMoveConfirm = true): confirms start & 1. e4 in ONE frame!
+        val a11ySession = BoardTrackingSession()
+        val a11yStartEv = a11ySession.onFrame(
+            analysis = startAnalysis,
+            currentBoard = startBoard,
+            currentPlayingAsWhite = true,
+            singleFrameMoveConfirm = true
+        )
+        assertTrue(
+            "Accessibility mode must detect NewGame on first frame",
+            a11yStartEv.any { it is BoardTrackingEvent.NewGameDetected }
+        )
+
+        val a11yMoveEv = a11ySession.onFrame(
+            analysis = e4Analysis,
+            currentBoard = startBoard,
+            currentPlayingAsWhite = true,
+            singleFrameMoveConfirm = true
+        )
+        val detectedMoves = a11yMoveEv.filterIsInstance<BoardTrackingEvent.MovesDetected>().firstOrNull()
+        assertNotNull("Accessibility mode must confirm 1. e4 in a single frame", detectedMoves)
+        assertEquals("e2e4", detectedMoves!!.moves.first().toUci())
+
+        // 2. Fast Cast mode (singleFrameMoveConfirm = false): still requires 2 consecutive frames
+        val castSession = BoardTrackingSession()
+        castSession.onFrame(startAnalysis, startBoard, currentPlayingAsWhite = true, singleFrameMoveConfirm = false)
+        castSession.onFrame(startAnalysis, startBoard, currentPlayingAsWhite = true, singleFrameMoveConfirm = false)
+
+        val castFrame1 = castSession.onFrame(e4Analysis, startBoard, currentPlayingAsWhite = true, singleFrameMoveConfirm = false)
+        assertTrue(
+            "Cast mode should wait for 2nd frame before confirming move",
+            castFrame1.none { it is BoardTrackingEvent.MovesDetected }
+        )
+        val castFrame2 = castSession.onFrame(e4Analysis, startBoard, currentPlayingAsWhite = true, singleFrameMoveConfirm = false)
+        val castMove = castFrame2.filterIsInstance<BoardTrackingEvent.MovesDetected>().firstOrNull()
+        assertNotNull("Cast mode should confirm 1. e4 on 2nd frame", castMove)
+        assertEquals("e2e4", castMove!!.moves.first().toUci())
+    }
+
+    @Test
+    fun autoReadStatusFormatterLabelsNoRedBoxAccessibilityModeCleanly() {
+        val locked = AutoReadStatusFormatter.formatStatus(
+            autoReadEnabled = true,
+            autoReadLive = true,
+            hasMediaProjectionGrant = true,
+            boardVisibleOrLocked = true,
+            playingAsWhite = true,
+            fullMoveNumber = 4,
+            framesCaptured = 9L,
+            bestScore = 0.96f,
+            lastCaptureError = null,
+            tapInputMode = false,
+            usingAccessibilityMode = true
+        )
+        assertEquals("No-Red-Box: Locked (White · move 4)", locked)
+
+        val scanning = AutoReadStatusFormatter.formatStatus(
+            autoReadEnabled = true,
+            autoReadLive = true,
+            hasMediaProjectionGrant = true,
+            boardVisibleOrLocked = false,
+            playingAsWhite = true,
+            fullMoveNumber = 1,
+            framesCaptured = 3L,
+            bestScore = 0.42f,
+            lastCaptureError = null,
+            tapInputMode = false,
+            usingAccessibilityMode = true
+        )
+        assertEquals("No-Red-Box: Scanning (3f · best 42%) — open a game", scanning)
+    }
 }

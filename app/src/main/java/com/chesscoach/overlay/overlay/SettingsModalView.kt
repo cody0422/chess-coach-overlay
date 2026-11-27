@@ -13,6 +13,7 @@ import com.chesscoach.overlay.R
 import com.chesscoach.overlay.data.OverlayPrefs
 import com.chesscoach.overlay.engine.EloAccuracyHelper
 import com.chesscoach.overlay.vision.AutoReadStatusFormatter
+import com.chesscoach.overlay.vision.ChessAccessibilityService
 
 class SettingsModalController(
     themedContext: Context,
@@ -22,6 +23,9 @@ class SettingsModalController(
     private val needsScreenPermissionProvider: () -> Boolean,
     private val onSettingsChanged: (reanalyze: Boolean) -> Unit,
     private val onAutoReadToggled: (enabled: Boolean) -> Unit,
+    private val onFastCastModeToggled: (useFastCast: Boolean) -> Unit,
+    private val onEnableNoRedBoxClicked: () -> Unit,
+    private val onOpenAppInfoClicked: () -> Unit,
     private val onTapInputToggled: (enabled: Boolean) -> Unit,
     private val onAlignClicked: () -> Unit,
     private val onFlipClicked: () -> Unit,
@@ -34,6 +38,9 @@ class SettingsModalController(
 
     private val tvScreenReadStatus: TextView = rootView.findViewById(R.id.tvScreenReadStatus)
     private val btnRedetect: AppCompatButton = rootView.findViewById(R.id.btnSettingsRedetect)
+    private val cardNoRedBox: View = rootView.findViewById(R.id.cardSettingsNoRedBox)
+    private val btnEnableNoRedBox: AppCompatButton = rootView.findViewById(R.id.btnSettingsEnableNoRedBox)
+    private val btnOpenAppInfo: AppCompatButton = rootView.findViewById(R.id.btnSettingsOpenAppInfo)
 
     private val seekElo: SeekBar = rootView.findViewById(R.id.seekTargetElo)
     private val tvEloValue: TextView = rootView.findViewById(R.id.tvEloValue)
@@ -48,8 +55,10 @@ class SettingsModalController(
     private val tvDepthCaption: TextView = rootView.findViewById(R.id.tvDepthCaption)
 
     private val swAutoReadScreen: SwitchCompat = rootView.findViewById(R.id.swAutoReadScreen)
+    private val swFastCastMode: SwitchCompat = rootView.findViewById(R.id.swFastCastMode)
     private val swTapInputMode: SwitchCompat = rootView.findViewById(R.id.swTapInputMode)
     private val swShowArrows: SwitchCompat = rootView.findViewById(R.id.swShowArrows)
+    private val swMyTurnOnly: SwitchCompat = rootView.findViewById(R.id.swMyTurnOnly)
     private val swMultiArrows: SwitchCompat = rootView.findViewById(R.id.swMultiArrows)
     private val swAnalyzeMyMoves: SwitchCompat = rootView.findViewById(R.id.swAnalyzeMyMoves)
     private val swBoardWarnings: SwitchCompat = rootView.findViewById(R.id.swBoardWarnings)
@@ -89,6 +98,14 @@ class SettingsModalController(
             onDismiss()
             onRedetectClicked()
         }
+        btnEnableNoRedBox.setOnClickListener {
+            onDismiss()
+            onEnableNoRedBoxClicked()
+        }
+        btnOpenAppInfo.setOnClickListener {
+            onDismiss()
+            onOpenAppInfoClicked()
+        }
 
         syncFromPrefs()
         bindListeners()
@@ -97,6 +114,7 @@ class SettingsModalController(
     fun updateScreenReadStatus(status: String) {
         tvScreenReadStatus.text = status
         updateRedetectButtonLabel()
+        updateNoRedBoxCardVisibility()
     }
 
     private fun updateRedetectButtonLabel() {
@@ -105,6 +123,14 @@ class SettingsModalController(
             autoReadEnabled = prefs.autoReadScreen,
             hasMediaProjectionGrant = hasGrant
         )
+    }
+
+    private fun updateNoRedBoxCardVisibility() {
+        val shouldOffer = ChessAccessibilityService.isSupportedOnDevice() &&
+            prefs.autoReadScreen &&
+            !prefs.useFastCastMode &&
+            !ChessAccessibilityService.isConnected()
+        cardNoRedBox.visibility = if (shouldOffer) View.VISIBLE else View.GONE
     }
 
     fun syncFromPrefs() {
@@ -126,8 +152,10 @@ class SettingsModalController(
             updateDepthLabels(depth)
 
             swAutoReadScreen.isChecked = prefs.autoReadScreen
+            swFastCastMode.isChecked = prefs.useFastCastMode
             swTapInputMode.isChecked = prefs.tapInputMode
             swShowArrows.isChecked = prefs.showArrows
+            swMyTurnOnly.isChecked = prefs.myTurnOnly
             swMultiArrows.isChecked = prefs.showMultiArrows
             swAnalyzeMyMoves.isChecked = prefs.analyzeMyMoves
             swBoardWarnings.isChecked = prefs.boardWarnings
@@ -138,6 +166,7 @@ class SettingsModalController(
 
             tvScreenReadStatus.text = screenReadStatusProvider()
             updateRedetectButtonLabel()
+            updateNoRedBoxCardVisibility()
             updatePlayStyleButton()
             updateSideButtons(prefs.playingAsWhite)
             tvEngineFooter.text = "Engine: ${engineNameProvider()} • ∞ Moves/Day"
@@ -192,6 +221,15 @@ class SettingsModalController(
             onAutoReadToggled(checked)
             tvScreenReadStatus.text = screenReadStatusProvider()
             updateRedetectButtonLabel()
+            updateNoRedBoxCardVisibility()
+        }
+        swFastCastMode.setOnCheckedChangeListener { _, checked ->
+            if (syncing) return@setOnCheckedChangeListener
+            prefs.useFastCastMode = checked
+            onFastCastModeToggled(checked)
+            tvScreenReadStatus.text = screenReadStatusProvider()
+            updateRedetectButtonLabel()
+            updateNoRedBoxCardVisibility()
         }
         swTapInputMode.setOnCheckedChangeListener { _, checked ->
             if (syncing) return@setOnCheckedChangeListener
@@ -202,6 +240,11 @@ class SettingsModalController(
             if (syncing) return@setOnCheckedChangeListener
             prefs.showArrows = checked
             onSettingsChanged(false)
+        }
+        swMyTurnOnly.setOnCheckedChangeListener { _, checked ->
+            if (syncing) return@setOnCheckedChangeListener
+            prefs.myTurnOnly = checked
+            onSettingsChanged(true)
         }
         swMultiArrows.setOnCheckedChangeListener { _, checked ->
             if (syncing) return@setOnCheckedChangeListener
@@ -249,14 +292,14 @@ class SettingsModalController(
             if (!prefs.playingAsWhite) {
                 prefs.playingAsWhite = true
                 updateSideButtons(true)
-                onSettingsChanged(false)
+                onSettingsChanged(true)
             }
         }
         btnPlayBlack.setOnClickListener {
             if (prefs.playingAsWhite) {
                 prefs.playingAsWhite = false
                 updateSideButtons(false)
-                onSettingsChanged(false)
+                onSettingsChanged(true)
             }
         }
     }

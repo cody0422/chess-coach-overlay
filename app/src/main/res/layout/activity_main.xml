@@ -178,7 +178,7 @@
                 android:textColor="@color/text_secondary"
                 android:textSize="13sp" />
 
-            <!-- Auto-Read Board (Screen Capture) Toggle -->
+            <!-- Auto-Read Board Toggle -->
             <LinearLayout
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
@@ -198,7 +198,7 @@
                     <TextView
                         android:layout_width="wrap_content"
                         android:layout_height="wrap_content"
-                        android:text="Auto-Read Board (Screen Capture)"
+                        android:text="Auto-Read Board"
                         android:textColor="@color/text_primary"
                         android:textSize="14sp"
                         android:textStyle="bold" />
@@ -219,6 +219,85 @@
                     android:checked="true"
                     android:thumbTint="@color/switch_thumb_tint"
                     android:trackTint="@color/switch_track_tint" />
+            </LinearLayout>
+
+            <!-- No-Red-Box Accessibility Mode Card (Android 11+) -->
+            <LinearLayout
+                android:id="@+id/cardNoRedBoxMain"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="10dp"
+                android:background="@drawable/bg_button_secondary"
+                android:orientation="vertical"
+                android:padding="12dp">
+
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:gravity="center_vertical"
+                    android:orientation="horizontal">
+
+                    <TextView
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:text="No-Red-Box Mode (Recommended)"
+                        android:textColor="@color/text_primary"
+                        android:textSize="13sp"
+                        android:textStyle="bold" />
+
+                    <TextView
+                        android:id="@+id/tvNoRedBoxStatus"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:text="Off"
+                        android:textColor="@color/warning_orange"
+                        android:textSize="12sp"
+                        android:textStyle="bold" />
+                </LinearLayout>
+
+                <TextView
+                    android:id="@+id/tvNoRedBoxHelper"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="4dp"
+                    android:lineSpacingExtra="2dp"
+                    android:text="Zero red box in status bar &amp; no Start Now popup. First time? Tap Open App Info → 3 dots (top right) → Allow restricted settings, then switch ON ChessCoach Board Reader."
+                    android:textColor="@color/text_secondary"
+                    android:textSize="11sp" />
+
+                <LinearLayout
+                    android:id="@+id/rowNoRedBoxButtons"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="10dp"
+                    android:orientation="horizontal">
+
+                    <androidx.appcompat.widget.AppCompatButton
+                        android:id="@+id/btnEnableNoRedBox"
+                        android:layout_width="0dp"
+                        android:layout_height="40dp"
+                        android:layout_marginEnd="8dp"
+                        android:layout_weight="1.35"
+                        android:background="@drawable/bg_badge_green"
+                        android:text="Enable No-Red-Box"
+                        android:textAllCaps="false"
+                        android:textColor="@color/accent_emerald"
+                        android:textSize="12sp"
+                        android:textStyle="bold" />
+
+                    <androidx.appcompat.widget.AppCompatButton
+                        android:id="@+id/btnOpenAppInfo"
+                        android:layout_width="0dp"
+                        android:layout_height="40dp"
+                        android:layout_weight="1"
+                        android:background="@drawable/bg_card_dark"
+                        android:text="Open App Info"
+                        android:textAllCaps="false"
+                        android:textColor="@color/text_primary"
+                        android:textSize="12sp"
+                        android:textStyle="bold" />
+                </LinearLayout>
             </LinearLayout>
 
             <androidx.appcompat.widget.AppCompatButton
@@ -278,7 +357,7 @@
                 android:layout_height="wrap_content"
                 android:layout_marginTop="10dp"
                 android:lineSpacingExtra="4dp"
-                android:text="1. Pick your chess app above, grant Overlay Permission, and tap Start Overlay. Tap Allow on the Screen Capture prompt (recommended) — your chess app opens right away."
+                android:text="1. Pick your chess app above, turn on No-Red-Box Mode once (zero status bar icon &amp; no popups), and tap Start Overlay — your chess app opens right away."
                 android:textColor="@color/text_secondary"
                 android:textSize="14sp" />
 
@@ -296,7 +375,7 @@
                 android:layout_height="wrap_content"
                 android:layout_marginTop="8dp"
                 android:lineSpacingExtra="4dp"
-                android:text="3. Use the sleek 3-button pill bar ([ ▶ | ≡ | ✕ ]) to pause/resume arrows, open Settings, or close. Drag anywhere on the pill to reposition."
+                android:text="3. Arrows show only on YOUR turn by default. Tap || / ▶ on the pill to pause/resume, ≡ for Settings, or ✕ to close."
                 android:textColor="@color/text_secondary"
                 android:textSize="14sp" />
 

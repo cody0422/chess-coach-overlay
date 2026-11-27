@@ -1,5 +1,8 @@
 package com.chesscoach.overlay.overlay
 
+import android.animation.Animator
+import android.animation.AnimatorListenerAdapter
+import android.animation.ValueAnimator
 import android.content.Context
 import android.graphics.Canvas
 import android.graphics.Color
@@ -9,6 +12,7 @@ import android.graphics.Path
 import android.graphics.RectF
 import android.view.MotionEvent
 import android.view.View
+import android.view.animation.DecelerateInterpolator
 import com.chesscoach.overlay.engine.AnalysisResult
 import com.chesscoach.overlay.engine.BoardWarning
 import com.chesscoach.overlay.engine.ChessBoard
@@ -47,7 +51,10 @@ class BoardOverlayView(context: Context) : View(context) {
 
     var flipped: Boolean = false
         set(value) {
-            field = value
+            if (field != value) {
+                field = value
+                snapPrimaryArrowEndpointsTo(targetPrimaryMove ?: renderedPrimaryMove)
+            }
             invalidate()
         }
 
@@ -107,6 +114,17 @@ class BoardOverlayView(context: Context) : View(context) {
     private var lastFeedback: MoveFeedback? = null
     private var gameStatus: GameStatus = GameStatus.ONGOING
     private var isAnalyzing: Boolean = false
+
+    // Smooth 60fps primary-arrow glide & fade animation state (normalized 0f..1f board coords)
+    private var renderedPrimaryMove: Move? = null
+    private var targetPrimaryMove: Move? = null
+    private var animFromX: Float = 0f
+    private var animFromY: Float = 0f
+    private var animToX: Float = 0f
+    private var animToY: Float = 0f
+    private var animAlpha: Float = 0f
+    private var arrowAnimator: ValueAnimator? = null
+    private val arrowInterpolator = DecelerateInterpolator(1.6f)
 
     private var selectedSquare: Int = -1
     private var legalTargetsForSelection: List<Move> = emptyList()
@@ -291,12 +309,127 @@ class BoardOverlayView(context: Context) : View(context) {
         selectedSquare = -1
         legalTargetsForSelection = emptyList()
         pendingPromotionMoves = emptyList()
+        animatePrimaryArrowTo(analysisResult?.topMoves?.firstOrNull()?.move)
+        invalidate()
+    }
+
+    fun setAnalysis(analysisResult: AnalysisResult?) {
+        analysis = analysisResult
+        animatePrimaryArrowTo(analysisResult?.topMoves?.firstOrNull()?.move)
         invalidate()
     }
 
     fun setAnalyzing(analyzing: Boolean) {
         isAnalyzing = analyzing
         invalidate()
+    }
+
+    override fun onDetachedFromWindow() {
+        arrowAnimator?.cancel()
+        arrowAnimator = null
+        super.onDetachedFromWindow()
+    }
+
+    private fun squareNormalizedCenter(sq: Int): Pair<Float, Float> {
+        val (col, row) = squareToScreenColRow(sq)
+        return ((col + 0.5f) / 8f) to ((row + 0.5f) / 8f)
+    }
+
+    private fun snapPrimaryArrowEndpointsTo(move: Move?) {
+        if (move == null) return
+        val (fx, fy) = squareNormalizedCenter(move.from)
+        val (tx, ty) = squareNormalizedCenter(move.to)
+        animFromX = fx
+        animFromY = fy
+        animToX = tx
+        animToY = ty
+    }
+
+    private fun animatePrimaryArrowTo(nextMove: Move?) {
+        // Ignore duplicate updates for the exact same primary move (e.g. deeper PV confirming same move)
+        if (nextMove != null && nextMove == targetPrimaryMove && animAlpha >= 0.99f) {
+            renderedPrimaryMove = nextMove
+            return
+        }
+        if (nextMove == null && targetPrimaryMove == null && renderedPrimaryMove == null) {
+            return
+        }
+
+        targetPrimaryMove = nextMove
+        arrowAnimator?.cancel()
+        arrowAnimator = null
+
+        if (nextMove == null) {
+            if (renderedPrimaryMove == null || animAlpha <= 0.01f) {
+                renderedPrimaryMove = null
+                animAlpha = 0f
+                return
+            }
+            val startAlpha = animAlpha
+            arrowAnimator = ValueAnimator.ofFloat(startAlpha, 0f).apply {
+                duration = 120L
+                interpolator = arrowInterpolator
+                addUpdateListener { anim ->
+                    animAlpha = anim.animatedValue as Float
+                    invalidate()
+                }
+                addListener(object : AnimatorListenerAdapter() {
+                    override fun onAnimationEnd(animation: Animator) {
+                        if (targetPrimaryMove == null) {
+                            renderedPrimaryMove = null
+                            animAlpha = 0f
+                            invalidate()
+                        }
+                    }
+                })
+                start()
+            }
+            return
+        }
+
+        val (endFromX, endFromY) = squareNormalizedCenter(nextMove.from)
+        val (endToX, endToY) = squareNormalizedCenter(nextMove.to)
+
+        if (renderedPrimaryMove == null || animAlpha < 0.05f) {
+            // Smooth appearance fade-in (160ms)
+            renderedPrimaryMove = nextMove
+            animFromX = endFromX
+            animFromY = endFromY
+            animToX = endToX
+            animToY = endToY
+            val startAlpha = animAlpha.coerceIn(0f, 1f)
+            arrowAnimator = ValueAnimator.ofFloat(startAlpha, 1f).apply {
+                duration = 160L
+                interpolator = arrowInterpolator
+                addUpdateListener { anim ->
+                    animAlpha = anim.animatedValue as Float
+                    invalidate()
+                }
+                start()
+            }
+        } else {
+            // Smooth endpoint glide + alpha settle between moves (150ms)
+            renderedPrimaryMove = nextMove
+            val startFX = animFromX
+            val startFY = animFromY
+            val startTX = animToX
+            val startTY = animToY
+            val startAlpha = animAlpha.coerceIn(0f, 1f)
+            arrowAnimator = ValueAnimator.ofFloat(0f, 1f).apply {
+                duration = 150L
+                interpolator = arrowInterpolator
+                addUpdateListener { anim ->
+                    val t = anim.animatedValue as Float
+                    animFromX = startFX + (endFromX - startFX) * t
+                    animFromY = startFY + (endFromY - startFY) * t
+                    animToX = startTX + (endToX - startTX) * t
+                    animToY = startTY + (endToY - startTY) * t
+                    animAlpha = startAlpha + (1f - startAlpha) * t
+                    invalidate()
+                }
+                start()
+            }
+        }
     }
 
     private fun squareToScreenColRow(sq: Int): Pair<Int, Int> {
@@ -390,12 +523,23 @@ class BoardOverlayView(context: Context) : View(context) {
         // Best-move arrows (drawn above markers so arrows are always crystal clear)
         if (showArrows) {
             val moves = analysis?.topMoves.orEmpty()
-            if (moves.isNotEmpty()) {
-                val count = if (showMultiArrows) min(moves.size, 3) else 1
-                // Draw secondary arrows first so primary #1 emerald arrow sits cleanly on top
-                for (i in (count - 1) downTo 0) {
+            if (showMultiArrows && moves.size > 1) {
+                val count = min(moves.size, 3)
+                for (i in (count - 1) downTo 1) {
                     drawMoveArrow(canvas, moves[i], i, minSq)
                 }
+            }
+            if (renderedPrimaryMove != null && animAlpha > 0.01f) {
+                drawMoveArrowCoords(
+                    canvas = canvas,
+                    x1 = animFromX * width,
+                    y1 = animFromY * height,
+                    x2 = animToX * width,
+                    y2 = animToY * height,
+                    rankIndex = 0,
+                    minSq = minSq,
+                    alphaScale = animAlpha.coerceIn(0f, 1f)
+                )
             }
         }
 
@@ -560,7 +704,19 @@ class BoardOverlayView(context: Context) : View(context) {
     private fun drawMoveArrow(canvas: Canvas, scored: ScoredMove, rankIndex: Int, minSq: Float) {
         val (x1, y1) = squareCenter(scored.move.from)
         val (x2, y2) = squareCenter(scored.move.to)
+        drawMoveArrowCoords(canvas, x1, y1, x2, y2, rankIndex, minSq, alphaScale = 1f)
+    }
 
+    private fun drawMoveArrowCoords(
+        canvas: Canvas,
+        x1: Float,
+        y1: Float,
+        x2: Float,
+        y2: Float,
+        rankIndex: Int,
+        minSq: Float,
+        alphaScale: Float
+    ) {
         val dx = x2 - x1
         val dy = y2 - y1
         val dist = hypot(dx, dy)
@@ -614,16 +770,24 @@ class BoardOverlayView(context: Context) : View(context) {
         // Draw light outer outline first so the slim black shaft stays 100% razor-crisp inside
         // while popping cleanly on both dark blue/slate/green and light cream/white squares.
         if (rankIndex == 0) {
-            arrowOutlinePaint.color = Color.parseColor("#CCF8FAFC")
+            val outlineAlpha = (0xCC * alphaScale).toInt().coerceIn(0, 255)
+            arrowOutlinePaint.color = Color.argb(outlineAlpha, 0xF8, 0xFA, 0xFC)
             arrowOutlinePaint.strokeWidth = 3.2f * density
             canvas.drawPath(arrowPath, arrowOutlinePaint)
         } else {
-            arrowOutlinePaint.color = Color.argb(140, 248, 250, 252)
+            val outlineAlpha = (140 * alphaScale).toInt().coerceIn(0, 255)
+            arrowOutlinePaint.color = Color.argb(outlineAlpha, 248, 250, 252)
             arrowOutlinePaint.strokeWidth = 2.2f * density
             canvas.drawPath(arrowPath, arrowOutlinePaint)
         }
 
-        arrowFillPaint.color = arrowColor
+        val fillAlpha = (Color.alpha(arrowColor) * alphaScale).toInt().coerceIn(0, 255)
+        arrowFillPaint.color = Color.argb(
+            fillAlpha,
+            Color.red(arrowColor),
+            Color.green(arrowColor),
+            Color.blue(arrowColor)
+        )
         canvas.drawPath(arrowPath, arrowFillPaint)
     }
 

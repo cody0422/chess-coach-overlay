@@ -1288,7 +1288,8 @@ class BoardTrackingSession {
     fun onFrame(
         analysis: FrameAnalysis,
         currentBoard: ChessBoard,
-        currentPlayingAsWhite: Boolean
+        currentPlayingAsWhite: Boolean,
+        singleFrameMoveConfirm: Boolean = false
     ): List<BoardTrackingEvent> {
         val events = ArrayList<BoardTrackingEvent>(2)
 
@@ -1326,8 +1327,9 @@ class BoardTrackingSession {
             pendingStableCount = 1
         }
 
-        // Wait for 2 consecutive stable frames before committing state changes
-        if (pendingStableCount < 2) {
+        // Wait for 2 consecutive stable frames in fast Cast mode, or 1 frame in Accessibility (~1s) mode
+        val requiredStableFrames = if (singleFrameMoveConfirm) 1 else 2
+        if (pendingStableCount < requiredStableFrames) {
             return events
         }
 
@@ -1384,20 +1386,22 @@ object AutoReadStatusFormatter {
         bestScore: Float,
         lastCaptureError: String?,
         tapInputMode: Boolean,
-        frameMaxLum: Int = -1
+        frameMaxLum: Int = -1,
+        usingAccessibilityMode: Boolean = false
     ): String {
+        val prefix = if (usingAccessibilityMode) "No-Red-Box" else "Auto-Read"
         return when {
             autoReadLive && boardVisibleOrLocked -> {
                 val side = if (playingAsWhite) "White" else "Black"
-                "Auto-Read: Locked ($side · move $fullMoveNumber)"
+                "$prefix: Locked ($side · move $fullMoveNumber)"
             }
             autoReadLive && framesCaptured == 0L ->
-                "Auto-Read: Waiting for screen frames..."
+                "$prefix: Waiting for screen frames..."
             autoReadLive && frameMaxLum in 0..11 ->
-                "Auto-Read: Blank frames (${framesCaptured}f) — tap Grant Access & pick Entire screen"
+                "$prefix: Blank frames (${framesCaptured}f) — tap Grant Access & pick Entire screen"
             autoReadLive -> {
                 val bestPct = (bestScore * 100f).toInt().coerceIn(0, 100)
-                "Auto-Read: Scanning (${framesCaptured}f · best $bestPct%) — open a game"
+                "$prefix: Scanning (${framesCaptured}f · best $bestPct%) — open a game"
             }
             autoReadEnabled && !hasMediaProjectionGrant && !lastCaptureError.isNullOrBlank() ->
                 "Auto-Read error: ${lastCaptureError.take(90)}"

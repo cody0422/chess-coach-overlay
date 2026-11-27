@@ -2,6 +2,8 @@ package com.chesscoach.overlay.engine
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import kotlin.random.Random
@@ -127,5 +129,135 @@ class ChessEngineTest {
         )
         assertNotNull(res.topMoves.firstOrNull())
         assertTrue(board.generateLegalMoves().contains(res.topMoves.first().move))
+    }
+
+    @Test
+    fun turnArrowPolicyHidesOpponentArrowsForBothWhiteAndBlack() {
+        val board = ChessBoard()
+        val sampleMove = board.generateLegalMoves().first { it.toUci() == "e2e4" }
+        val sampleAnalysis = AnalysisResult(
+            topMoves = listOf(ScoredMove(sampleMove, 35)),
+            whiteEvalCp = 35,
+            whiteMateIn = null,
+            depth = 12,
+            nodes = 50000L,
+            engineName = "Stockfish 19"
+        )
+
+        // Playing as White, start position (White to move) -> SHOW
+        assertTrue(TurnArrowPolicy.shouldShowArrow(myTurnOnly = true, sideToMove = board.sideToMove, playingAsWhite = true))
+        assertNotNull(TurnArrowPolicy.filterAnalysisForDisplay(sampleAnalysis, myTurnOnly = true, sideToMove = board.sideToMove, playingAsWhite = true))
+
+        // Playing as Black, start position (White to move = opponent!) -> HIDE
+        assertFalse(TurnArrowPolicy.shouldShowArrow(myTurnOnly = true, sideToMove = board.sideToMove, playingAsWhite = false))
+        assertNull(TurnArrowPolicy.filterAnalysisForDisplay(sampleAnalysis, myTurnOnly = true, sideToMove = board.sideToMove, playingAsWhite = false))
+
+        // After 1. e4 -> Black to move
+        board.pushMove(sampleMove)
+        assertEquals(Piece.BLACK, board.sideToMove)
+
+        // Playing as White -> opponent's turn -> HIDE
+        assertFalse(TurnArrowPolicy.shouldShowArrow(myTurnOnly = true, sideToMove = board.sideToMove, playingAsWhite = true))
+        assertNull(TurnArrowPolicy.filterAnalysisForDisplay(sampleAnalysis, myTurnOnly = true, sideToMove = board.sideToMove, playingAsWhite = true))
+
+        // Playing as Black -> our turn -> SHOW
+        assertTrue(TurnArrowPolicy.shouldShowArrow(myTurnOnly = true, sideToMove = board.sideToMove, playingAsWhite = false))
+        assertNotNull(TurnArrowPolicy.filterAnalysisForDisplay(sampleAnalysis, myTurnOnly = true, sideToMove = board.sideToMove, playingAsWhite = false))
+
+        // After 1... e5 -> White to move again
+        val e5 = board.generateLegalMoves().first { it.toUci() == "e7e5" }
+        board.pushMove(e5)
+        assertTrue(TurnArrowPolicy.shouldShowArrow(myTurnOnly = true, sideToMove = board.sideToMove, playingAsWhite = true))
+        assertFalse(TurnArrowPolicy.shouldShowArrow(myTurnOnly = true, sideToMove = board.sideToMove, playingAsWhite = false))
+
+        // When myTurnOnly = false -> always SHOW on both turns
+        assertTrue(TurnArrowPolicy.shouldShowArrow(myTurnOnly = false, sideToMove = Piece.WHITE, playingAsWhite = false))
+        assertTrue(TurnArrowPolicy.shouldShowArrow(myTurnOnly = false, sideToMove = Piece.BLACK, playingAsWhite = true))
+    }
+
+    @Test
+    fun stockfishUciParserStreamsInterimMovesAtDepth7WithThrottleAndMoveChange() {
+        val board = ChessBoard()
+        val legalMoves = board.generateLegalMoves()
+
+        val lineD6 = "info depth 6 seldepth 8 multipv 1 score cp 28 nodes 4200 pv e2e4 e7e5"
+        val parsed6 = StockfishUciParser.parseInfoLine(lineD6, legalMoves)
+        assertNotNull(parsed6)
+        assertEquals(6, parsed6!!.depth)
+        assertEquals("e2e4", parsed6.scoredMove.move.toUci())
+        assertEquals(28, parsed6.scoredMove.scoreCp)
+
+        // Below depth 7 -> never emit interim
+        assertFalse(
+            StockfishUciParser.shouldEmitInterim(
+                depth = 6,
+                topMoveUci = "e2e4",
+                lastEmittedMoveUci = null,
+                nowMs = 1000L,
+                lastEmitMs = 0L
+            )
+        )
+
+        // First emit at depth 7 -> emit immediately!
+        assertTrue(
+            StockfishUciParser.shouldEmitInterim(
+                depth = 7,
+                topMoveUci = "e2e4",
+                lastEmittedMoveUci = null,
+                nowMs = 1050L,
+                lastEmitMs = 0L
+            )
+        )
+
+        // Same move 30ms later -> throttled
+        assertFalse(
+            StockfishUciParser.shouldEmitInterim(
+                depth = 8,
+                topMoveUci = "e2e4",
+                lastEmittedMoveUci = "e2e4",
+                nowMs = 1080L,
+                lastEmitMs = 1050L
+            )
+        )
+
+        // Same move 80ms later -> allowed
+        assertTrue(
+            StockfishUciParser.shouldEmitInterim(
+                depth = 9,
+                topMoveUci = "e2e4",
+                lastEmittedMoveUci = "e2e4",
+                nowMs = 1130L,
+                lastEmitMs = 1050L
+            )
+        )
+
+        // Top move changed just 15ms later -> emit immediately without waiting for 70ms throttle!
+        assertTrue(
+            StockfishUciParser.shouldEmitInterim(
+                depth = 10,
+                topMoveUci = "d2d4",
+                lastEmittedMoveUci = "e2e4",
+                nowMs = 1145L,
+                lastEmitMs = 1130L
+            )
+        )
+
+        // Build AnalysisResult from parsed PV map
+        val pvMap = mapOf(1 to parsed6.scoredMove)
+        val built = StockfishUciParser.buildAnalysisResult(
+            sourceBoard = board,
+            pvByRank = pvMap,
+            highestDepth = 10,
+            lastNodes = 90000L,
+            clampedElo = 3500,
+            clampedAcc = 100,
+            playStyle = PlayStyle.DEFAULT,
+            multiPv = 3,
+            legalMoves = legalMoves
+        )
+        assertNotNull(built)
+        assertEquals("Stockfish 19", built!!.engineName)
+        assertEquals("e2e4", built.topMoves.first().move.toUci())
+        assertEquals(28, built.whiteEvalCp)
     }
 }

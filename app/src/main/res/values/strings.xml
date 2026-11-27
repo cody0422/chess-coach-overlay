@@ -7,6 +7,8 @@
     <string name="start_overlay">Start Overlay</string>
     <string name="stop_overlay">Stop Overlay</string>
     <string name="overlay_running_notif_title">ChessCoach Overlay Active</string>
-    <string name="overlay_running_notif_text">Offline chess engine running • Unlimited moves</string>
+    <string name="overlay_running_notif_text">Offline Stockfish 19 running • Unlimited moves</string>
     <string name="notif_channel_name">Chess Coach Overlay</string>
+    <string name="accessibility_service_label">ChessCoach Board Reader (No Red Box)</string>
+    <string name="accessibility_service_description">Silently reads your chess board on screen so ChessCoach Overlay tracks moves without showing Android\'s red cast box.</string>
 </resources>

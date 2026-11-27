@@ -11,15 +11,205 @@ import kotlin.math.max
 import kotlin.random.Random
 
 /**
- * Wraps the optional bundled native Stockfish UCI binary (`libstockfish.so` in nativeLibraryDir)
- * and seamlessly falls back to the pure-Kotlin [ChessEngine] whenever the binary is absent
- * or encounters any runtime error.
+ * Pure-Kotlin policy governing when best-move arrows should be computed/displayed
+ * when "My Turn Only" is enabled (default true so opponent pieces never get arrows).
+ */
+object TurnArrowPolicy {
+    fun myColor(playingAsWhite: Boolean): Int =
+        if (playingAsWhite) Piece.WHITE else Piece.BLACK
+
+    fun isMyTurn(sideToMove: Int, playingAsWhite: Boolean): Boolean =
+        sideToMove == myColor(playingAsWhite)
+
+    fun shouldShowArrow(
+        myTurnOnly: Boolean,
+        sideToMove: Int,
+        playingAsWhite: Boolean
+    ): Boolean {
+        return !myTurnOnly || isMyTurn(sideToMove, playingAsWhite)
+    }
+
+    fun filterAnalysisForDisplay(
+        analysis: AnalysisResult?,
+        myTurnOnly: Boolean,
+        sideToMove: Int,
+        playingAsWhite: Boolean
+    ): AnalysisResult? {
+        if (analysis == null) return null
+        return if (shouldShowArrow(myTurnOnly, sideToMove, playingAsWhite)) analysis else null
+    }
+}
+
+data class ParsedUciInfo(
+    val multiPv: Int,
+    val depth: Int,
+    val nodes: Long,
+    val scoredMove: ScoredMove
+)
+
+/**
+ * Pure-Kotlin UCI `info` parser & live-PV interim streaming policy.
+ * Kept Android-free so every branch is directly covered by JVM unit tests.
+ */
+object StockfishUciParser {
+    const val MIN_INTERIM_DEPTH = 7
+    const val MIN_INTERIM_INTERVAL_MS = 70L
+
+    fun parseInfoLine(line: String, legalMoves: List<Move>): ParsedUciInfo? {
+        if (!line.startsWith("info ") || !line.contains(" pv ")) return null
+        val tokens = line.trim().split(Regex("\\s+"))
+        var depth = 0
+        var multiPv = 1
+        var nodes = 0L
+        var scoreCp = 0
+        var mateIn: Int? = null
+        var hasScore = false
+        var firstPvMove: String? = null
+
+        var i = 1
+        while (i < tokens.size) {
+            when (tokens[i]) {
+                "depth" -> {
+                    depth = tokens.getOrNull(i + 1)?.toIntOrNull() ?: depth
+                    i += 2
+                }
+                "multipv" -> {
+                    multiPv = tokens.getOrNull(i + 1)?.toIntOrNull() ?: 1
+                    i += 2
+                }
+                "nodes" -> {
+                    nodes = tokens.getOrNull(i + 1)?.toLongOrNull() ?: nodes
+                    i += 2
+                }
+                "score" -> {
+                    val kind = tokens.getOrNull(i + 1)
+                    val value = tokens.getOrNull(i + 2)?.toIntOrNull()
+                    if (kind == "cp" && value != null) {
+                        scoreCp = value
+                        mateIn = null
+                        hasScore = true
+                        i += 3
+                    } else if (kind == "mate" && value != null) {
+                        mateIn = value
+                        scoreCp = if (value > 0) {
+                            EloAccuracyHelper.MATE_SCORE - value * 2
+                        } else {
+                            -(EloAccuracyHelper.MATE_SCORE + value * 2)
+                        }
+                        hasScore = true
+                        i += 3
+                    } else {
+                        i++
+                    }
+                }
+                "pv" -> {
+                    firstPvMove = tokens.getOrNull(i + 1)
+                    break
+                }
+                else -> i++
+            }
+        }
+
+        if (!hasScore || firstPvMove == null) return null
+        val move = matchUciMove(firstPvMove, legalMoves) ?: return null
+        return ParsedUciInfo(
+            multiPv = multiPv,
+            depth = depth,
+            nodes = nodes,
+            scoredMove = ScoredMove(move, scoreCp, mateIn)
+        )
+    }
+
+    fun matchUciMove(uci: String, legalMoves: List<Move>): Move? {
+        val clean = uci.trim().lowercase()
+        return legalMoves.firstOrNull { it.toUci() == clean }
+    }
+
+    fun shouldEmitInterim(
+        depth: Int,
+        topMoveUci: String,
+        lastEmittedMoveUci: String?,
+        nowMs: Long,
+        lastEmitMs: Long,
+        minDepth: Int = MIN_INTERIM_DEPTH,
+        minIntervalMs: Long = MIN_INTERIM_INTERVAL_MS
+    ): Boolean {
+        if (depth < minDepth) return false
+        if (lastEmittedMoveUci == null) return true
+        if (topMoveUci != lastEmittedMoveUci) return true
+        return (nowMs - lastEmitMs) >= minIntervalMs
+    }
+
+    fun buildAnalysisResult(
+        sourceBoard: ChessBoard,
+        pvByRank: Map<Int, ScoredMove>,
+        highestDepth: Int,
+        lastNodes: Long,
+        clampedElo: Int,
+        clampedAcc: Int,
+        playStyle: PlayStyle,
+        multiPv: Int,
+        bestMoveUci: String? = null,
+        legalMoves: List<Move> = emptyList(),
+        rng: Random = Random.Default
+    ): AnalysisResult? {
+        val sortedCandidates = pvByRank.entries
+            .sortedBy { it.key }
+            .map { it.value }
+            .distinctBy { it.move.toUci() }
+            .sortedByDescending { it.scoreCp }
+            .toMutableList()
+
+        if (sortedCandidates.isEmpty() && bestMoveUci != null) {
+            val matched = matchUciMove(bestMoveUci, legalMoves)
+            if (matched != null) {
+                sortedCandidates.add(ScoredMove(matched, 0, null))
+            }
+        }
+
+        if (sortedCandidates.isEmpty()) return null
+
+        val styledCandidates = EloAccuracyHelper.applyPlayStyle(sourceBoard, sortedCandidates, playStyle)
+        val selectedOrder = EloAccuracyHelper.selectByEloAndAccuracy(
+            sortedCandidates = styledCandidates,
+            targetElo = clampedElo,
+            targetAccuracy = clampedAcc,
+            engineAlreadyStrengthLimited = (clampedElo <= 3190),
+            rng = rng
+        ).take(multiPv.coerceAtLeast(1))
+
+        val bestOverall = sortedCandidates.first()
+        val whiteEvalCp = if (sourceBoard.sideToMove == Piece.WHITE) {
+            bestOverall.scoreCp
+        } else {
+            -bestOverall.scoreCp
+        }
+        val whiteMateIn = bestOverall.mateIn?.let { m ->
+            if (sourceBoard.sideToMove == Piece.WHITE) m else -m
+        }
+
+        return AnalysisResult(
+            topMoves = selectedOrder,
+            whiteEvalCp = whiteEvalCp,
+            whiteMateIn = whiteMateIn,
+            depth = highestDepth.coerceAtLeast(1),
+            nodes = lastNodes,
+            engineName = "Stockfish 19"
+        )
+    }
+}
+
+/**
+ * Wraps the optional bundled native Stockfish 19 UCI binary (`libstockfish.so` in nativeLibraryDir)
+ * with live PV streaming (~50ms first arrow) and seamlessly falls back to the pure-Kotlin
+ * [ChessEngine] whenever the binary is absent or encounters any runtime error.
  */
 class StockfishUciEngine(private val context: Context) {
 
     private val fallbackEngine = ChessEngine()
     private val ioLock = Any()
     private val searching = AtomicBoolean(false)
+    private val cancelRequested = AtomicBoolean(false)
 
     @Volatile
     private var process: Process? = null
@@ -102,6 +292,7 @@ class StockfishUciEngine(private val context: Context) {
     }
 
     fun cancel() {
+        cancelRequested.set(true)
         fallbackEngine.cancel()
         if (searching.get()) {
             try {
@@ -122,7 +313,8 @@ class StockfishUciEngine(private val context: Context) {
         targetAccuracy: Int = EloAccuracyHelper.DEFAULT_ACCURACY,
         playStyle: PlayStyle = PlayStyle.DEFAULT,
         multiPv: Int = 3,
-        rng: Random = Random.Default
+        rng: Random = Random.Default,
+        onInterimResult: ((AnalysisResult) -> Unit)? = null
     ): AnalysisResult {
         val legalMoves = sourceBoard.generateLegalMoves()
         if (legalMoves.isEmpty()) {
@@ -138,7 +330,8 @@ class StockfishUciEngine(private val context: Context) {
                 targetAccuracy = targetAccuracy,
                 playStyle = playStyle,
                 multiPv = multiPv,
-                rng = rng
+                rng = rng,
+                onInterimResult = onInterimResult
             )
             if (sfResult != null) {
                 return sfResult
@@ -166,7 +359,8 @@ class StockfishUciEngine(private val context: Context) {
         targetAccuracy: Int,
         playStyle: PlayStyle,
         multiPv: Int,
-        rng: Random
+        rng: Random,
+        onInterimResult: ((AnalysisResult) -> Unit)?
     ): AnalysisResult? {
         synchronized(ioLock) {
             if (process?.isAlive != true) {
@@ -181,11 +375,12 @@ class StockfishUciEngine(private val context: Context) {
             val actualPv = wantPv.coerceAtMost(legalMoves.size).coerceAtLeast(1)
 
             return try {
+                cancelRequested.set(false)
                 searching.set(true)
 
                 sendLineLocked("setoption name MultiPV value $actualPv")
 
-                // Configure Stockfish strength for 400..4000 Elo
+                // Configure Stockfish 19 strength for 400..4000 Elo
                 when {
                     clampedElo > 3190 -> {
                         sendLineLocked("setoption name UCI_LimitStrength value false")
@@ -208,9 +403,10 @@ class StockfishUciEngine(private val context: Context) {
                     throw IllegalStateException("Stockfish not ready")
                 }
 
-                sendLineLocked("position fen ${sourceBoard.toFen()}")
+                val fen = sourceBoard.toFen()
+                sendLineLocked("position fen $fen")
 
-                // Map depth slider (1..8) + Elo to Stockfish depth & safe movetime cap
+                // Map depth slider (1..8) + Elo to Stockfish depth & responsive movetime cap
                 val sfDepth = when {
                     clampedElo < 900 -> clampedDepth.coerceIn(1, 4)
                     clampedElo < 1320 -> (clampedDepth + 1).coerceIn(2, 6)
@@ -218,10 +414,15 @@ class StockfishUciEngine(private val context: Context) {
                     else -> (clampedDepth + 4).coerceIn(3, 14)
                 }
                 val moveTimeMs = when {
-                    clampedDepth <= 2 -> 200
-                    clampedDepth <= 4 -> 550
-                    clampedDepth <= 6 -> 1200
-                    else -> 2200
+                    clampedDepth <= 2 -> 180
+                    clampedDepth <= 4 -> 380
+                    clampedDepth <= 6 -> 650
+                    else -> 1200
+                }
+                val interimMinDepth = if (sfDepth < StockfishUciParser.MIN_INTERIM_DEPTH) {
+                    sfDepth.coerceAtLeast(1)
+                } else {
+                    StockfishUciParser.MIN_INTERIM_DEPTH
                 }
 
                 sendLineLocked("go depth $sfDepth movetime $moveTimeMs")
@@ -230,17 +431,52 @@ class StockfishUciEngine(private val context: Context) {
                 var highestDepth = 0
                 var lastNodes = 0L
                 var bestMoveUci: String? = null
+                var lastInterimMoveUci: String? = null
+                var lastInterimEmitMs = 0L
+                val deterministicInterimSeed = fen.hashCode().toLong()
                 val hardDeadline = System.currentTimeMillis() + moveTimeMs + 3500L
 
                 val r = reader ?: return null
                 while (System.currentTimeMillis() < hardDeadline) {
                     val line = r.readLine() ?: break
                     if (line.startsWith("info ") && line.contains(" pv ")) {
-                        val parsed = parseInfoLine(line, legalMoves)
+                        val parsed = StockfishUciParser.parseInfoLine(line, legalMoves)
                         if (parsed != null) {
                             if (parsed.depth > highestDepth) highestDepth = parsed.depth
                             if (parsed.nodes > lastNodes) lastNodes = parsed.nodes
                             pvByRank[parsed.multiPv] = parsed.scoredMove
+
+                            if (onInterimResult != null && !cancelRequested.get() && parsed.multiPv == 1) {
+                                val now = System.currentTimeMillis()
+                                val topUci = parsed.scoredMove.move.toUci()
+                                if (StockfishUciParser.shouldEmitInterim(
+                                        depth = parsed.depth,
+                                        topMoveUci = topUci,
+                                        lastEmittedMoveUci = lastInterimMoveUci,
+                                        nowMs = now,
+                                        lastEmitMs = lastInterimEmitMs,
+                                        minDepth = interimMinDepth
+                                    )
+                                ) {
+                                    val interim = StockfishUciParser.buildAnalysisResult(
+                                        sourceBoard = sourceBoard,
+                                        pvByRank = pvByRank,
+                                        highestDepth = highestDepth,
+                                        lastNodes = lastNodes,
+                                        clampedElo = clampedElo,
+                                        clampedAcc = clampedAcc,
+                                        playStyle = playStyle,
+                                        multiPv = multiPv,
+                                        legalMoves = legalMoves,
+                                        rng = Random(deterministicInterimSeed)
+                                    )
+                                    if (interim != null && !cancelRequested.get()) {
+                                        lastInterimMoveUci = interim.topMoves.firstOrNull()?.move?.toUci() ?: topUci
+                                        lastInterimEmitMs = now
+                                        onInterimResult(interim)
+                                    }
+                                }
+                            }
                         }
                     } else if (line.startsWith("bestmove ")) {
                         val tokens = line.split(' ')
@@ -251,48 +487,18 @@ class StockfishUciEngine(private val context: Context) {
 
                 searching.set(false)
 
-                val sortedCandidates = pvByRank.entries
-                    .sortedBy { it.key }
-                    .map { it.value }
-                    .distinctBy { it.move.toUci() }
-                    .sortedByDescending { it.scoreCp }
-                    .toMutableList()
-
-                if (sortedCandidates.isEmpty() && bestMoveUci != null) {
-                    val matched = matchUciMove(bestMoveUci, legalMoves)
-                    if (matched != null) {
-                        sortedCandidates.add(ScoredMove(matched, 0, null))
-                    }
-                }
-
-                if (sortedCandidates.isEmpty()) return null
-
-                val styledCandidates = EloAccuracyHelper.applyPlayStyle(sourceBoard, sortedCandidates, playStyle)
-                val selectedOrder = EloAccuracyHelper.selectByEloAndAccuracy(
-                    sortedCandidates = styledCandidates,
-                    targetElo = clampedElo,
-                    targetAccuracy = clampedAcc,
-                    engineAlreadyStrengthLimited = (clampedElo <= 3190),
+                StockfishUciParser.buildAnalysisResult(
+                    sourceBoard = sourceBoard,
+                    pvByRank = pvByRank,
+                    highestDepth = highestDepth,
+                    lastNodes = lastNodes,
+                    clampedElo = clampedElo,
+                    clampedAcc = clampedAcc,
+                    playStyle = playStyle,
+                    multiPv = multiPv,
+                    bestMoveUci = bestMoveUci,
+                    legalMoves = legalMoves,
                     rng = rng
-                ).take(multiPv.coerceAtLeast(1))
-
-                val bestOverall = sortedCandidates.first()
-                val whiteEvalCp = if (sourceBoard.sideToMove == Piece.WHITE) {
-                    bestOverall.scoreCp
-                } else {
-                    -bestOverall.scoreCp
-                }
-                val whiteMateIn = bestOverall.mateIn?.let { m ->
-                    if (sourceBoard.sideToMove == Piece.WHITE) m else -m
-                }
-
-                AnalysisResult(
-                    topMoves = selectedOrder,
-                    whiteEvalCp = whiteEvalCp,
-                    whiteMateIn = whiteMateIn,
-                    depth = highestDepth.coerceAtLeast(1),
-                    nodes = lastNodes,
-                    engineName = "Stockfish 19"
                 )
             } catch (_: Throwable) {
                 searching.set(false)
@@ -301,82 +507,6 @@ class StockfishUciEngine(private val context: Context) {
                 null
             }
         }
-    }
-
-    private data class ParsedInfo(
-        val multiPv: Int,
-        val depth: Int,
-        val nodes: Long,
-        val scoredMove: ScoredMove
-    )
-
-    private fun parseInfoLine(line: String, legalMoves: List<Move>): ParsedInfo? {
-        val tokens = line.trim().split(Regex("\\s+"))
-        var depth = 0
-        var multiPv = 1
-        var nodes = 0L
-        var scoreCp = 0
-        var mateIn: Int? = null
-        var hasScore = false
-        var firstPvMove: String? = null
-
-        var i = 1
-        while (i < tokens.size) {
-            when (tokens[i]) {
-                "depth" -> {
-                    depth = tokens.getOrNull(i + 1)?.toIntOrNull() ?: depth
-                    i += 2
-                }
-                "multipv" -> {
-                    multiPv = tokens.getOrNull(i + 1)?.toIntOrNull() ?: 1
-                    i += 2
-                }
-                "nodes" -> {
-                    nodes = tokens.getOrNull(i + 1)?.toLongOrNull() ?: nodes
-                    i += 2
-                }
-                "score" -> {
-                    val kind = tokens.getOrNull(i + 1)
-                    val value = tokens.getOrNull(i + 2)?.toIntOrNull()
-                    if (kind == "cp" && value != null) {
-                        scoreCp = value
-                        mateIn = null
-                        hasScore = true
-                        i += 3
-                    } else if (kind == "mate" && value != null) {
-                        mateIn = value
-                        scoreCp = if (value > 0) {
-                            EloAccuracyHelper.MATE_SCORE - value * 2
-                        } else {
-                            -(EloAccuracyHelper.MATE_SCORE + value * 2)
-                        }
-                        hasScore = true
-                        i += 3
-                    } else {
-                        i++
-                    }
-                }
-                "pv" -> {
-                    firstPvMove = tokens.getOrNull(i + 1)
-                    break
-                }
-                else -> i++
-            }
-        }
-
-        if (!hasScore || firstPvMove == null) return null
-        val move = matchUciMove(firstPvMove, legalMoves) ?: return null
-        return ParsedInfo(
-            multiPv = multiPv,
-            depth = depth,
-            nodes = nodes,
-            scoredMove = ScoredMove(move, scoreCp, mateIn)
-        )
-    }
-
-    private fun matchUciMove(uci: String, legalMoves: List<Move>): Move? {
-        val clean = uci.trim().lowercase()
-        return legalMoves.firstOrNull { it.toUci() == clean }
     }
 
     private fun sendLineLocked(cmd: String) {

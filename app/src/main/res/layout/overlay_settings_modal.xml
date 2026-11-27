@@ -166,6 +166,66 @@
                     android:textStyle="bold" />
             </LinearLayout>
 
+            <!-- No-Red-Box Accessibility Quick-Setup Card (shown when Accessibility is not yet ON) -->
+            <LinearLayout
+                android:id="@+id/cardSettingsNoRedBox"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:background="@drawable/bg_card_dark"
+                android:orientation="vertical"
+                android:padding="10dp"
+                android:visibility="gone">
+
+                <TextView
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:text="Remove Red Status-Bar Box (Recommended)"
+                    android:textColor="@color/accent_emerald"
+                    android:textSize="12sp"
+                    android:textStyle="bold" />
+
+                <TextView
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="3dp"
+                    android:text="First time on Samsung? Tap App Info → 3 dots (top right) → Allow restricted settings, then switch ON ChessCoach Board Reader."
+                    android:textColor="@color/text_secondary"
+                    android:textSize="11sp" />
+
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="8dp"
+                    android:orientation="horizontal">
+
+                    <androidx.appcompat.widget.AppCompatButton
+                        android:id="@+id/btnSettingsEnableNoRedBox"
+                        android:layout_width="0dp"
+                        android:layout_height="34dp"
+                        android:layout_marginEnd="6dp"
+                        android:layout_weight="1.35"
+                        android:background="@drawable/bg_button_primary"
+                        android:text="Enable No-Red-Box"
+                        android:textAllCaps="false"
+                        android:textColor="#071A12"
+                        android:textSize="11sp"
+                        android:textStyle="bold" />
+
+                    <androidx.appcompat.widget.AppCompatButton
+                        android:id="@+id/btnSettingsOpenAppInfo"
+                        android:layout_width="0dp"
+                        android:layout_height="34dp"
+                        android:layout_weight="1"
+                        android:background="@drawable/bg_button_secondary"
+                        android:text="Open App Info"
+                        android:textAllCaps="false"
+                        android:textColor="@color/text_primary"
+                        android:textSize="11sp"
+                        android:textStyle="bold" />
+                </LinearLayout>
+            </LinearLayout>
+
             <!-- Target Elo Slider (400 - 4000) -->
             <LinearLayout
                 android:layout_width="match_parent"
@@ -357,6 +417,42 @@
                     android:trackTint="@color/switch_track_tint" />
             </LinearLayout>
 
+            <!-- Toggle: Use Fast Cast Mode (optional MediaProjection fallback) -->
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="44dp"
+                android:gravity="center_vertical"
+                android:orientation="horizontal">
+
+                <LinearLayout
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:orientation="vertical">
+
+                    <TextView
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:text="Use Fast Cast Mode"
+                        android:textColor="@color/text_primary"
+                        android:textSize="14sp" />
+
+                    <TextView
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:text="High-FPS capture (shows status bar icon)"
+                        android:textColor="@color/text_secondary"
+                        android:textSize="10sp" />
+                </LinearLayout>
+
+                <androidx.appcompat.widget.SwitchCompat
+                    android:id="@+id/swFastCastMode"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:thumbTint="@color/switch_thumb_tint"
+                    android:trackTint="@color/switch_track_tint" />
+            </LinearLayout>
+
             <!-- Toggle: Show Arrows -->
             <LinearLayout
                 android:layout_width="match_parent"
@@ -376,6 +472,43 @@
                     android:id="@+id/swShowArrows"
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
+                    android:thumbTint="@color/switch_thumb_tint"
+                    android:trackTint="@color/switch_track_tint" />
+            </LinearLayout>
+
+            <!-- Toggle: My Turn Only (hides arrows for opponent pieces) -->
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="44dp"
+                android:gravity="center_vertical"
+                android:orientation="horizontal">
+
+                <LinearLayout
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:orientation="vertical">
+
+                    <TextView
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:text="My Turn Only"
+                        android:textColor="@color/text_primary"
+                        android:textSize="14sp" />
+
+                    <TextView
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:text="Only show arrows for your pieces"
+                        android:textColor="@color/text_secondary"
+                        android:textSize="10sp" />
+                </LinearLayout>
+
+                <androidx.appcompat.widget.SwitchCompat
+                    android:id="@+id/swMyTurnOnly"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:checked="true"
                     android:thumbTint="@color/switch_thumb_tint"
                     android:trackTint="@color/switch_track_tint" />
             </LinearLayout>

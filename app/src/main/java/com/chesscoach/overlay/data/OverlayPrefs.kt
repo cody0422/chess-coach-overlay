@@ -87,6 +87,14 @@ class OverlayPrefs(context: Context) {
         get() = prefs.getBoolean(KEY_SHOW_ARROWS, true)
         set(value) = prefs.edit().putBoolean(KEY_SHOW_ARROWS, value).apply()
 
+    var myTurnOnly: Boolean
+        get() = prefs.getBoolean(KEY_MY_TURN_ONLY, true)
+        set(value) = prefs.edit().putBoolean(KEY_MY_TURN_ONLY, value).apply()
+
+    var useFastCastMode: Boolean
+        get() = prefs.getBoolean(KEY_USE_FAST_CAST_MODE, false)
+        set(value) = prefs.edit().putBoolean(KEY_USE_FAST_CAST_MODE, value).apply()
+
     var showMultiArrows: Boolean
         get() = prefs.getBoolean(KEY_SHOW_MULTI_ARROWS, false)
         set(value) = prefs.edit().putBoolean(KEY_SHOW_MULTI_ARROWS, value).apply()
@@ -183,6 +191,8 @@ class OverlayPrefs(context: Context) {
         private const val KEY_AUTO_READ_SCREEN = "auto_read_screen"
         private const val KEY_TAP_INPUT_MODE = "tap_input_mode"
         private const val KEY_SHOW_ARROWS = "show_arrows"
+        private const val KEY_MY_TURN_ONLY = "my_turn_only"
+        private const val KEY_USE_FAST_CAST_MODE = "use_fast_cast_mode"
         private const val KEY_SHOW_MULTI_ARROWS = "show_multi_arrows"
         private const val KEY_ANALYZE_MY_MOVES = "analyze_my_moves"
         private const val KEY_BOARD_WARNINGS = "board_warnings"

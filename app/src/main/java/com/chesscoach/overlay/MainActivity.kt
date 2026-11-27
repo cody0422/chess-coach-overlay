@@ -34,6 +34,7 @@ import androidx.core.content.ContextCompat
 import com.chesscoach.overlay.data.OverlayPrefs
 import com.chesscoach.overlay.engine.StockfishUciEngine
 import com.chesscoach.overlay.overlay.OverlayService
+import com.chesscoach.overlay.vision.ChessAccessibilityService
 
 class MainActivity : AppCompatActivity() {
 
@@ -48,6 +49,12 @@ class MainActivity : AppCompatActivity() {
     private lateinit var tvEngineStatus: TextView
     private lateinit var tvCurrentConfig: TextView
     private lateinit var swAutoReadBoardMain: SwitchCompat
+    private lateinit var cardNoRedBoxMain: View
+    private lateinit var tvNoRedBoxStatus: TextView
+    private lateinit var tvNoRedBoxHelper: TextView
+    private lateinit var rowNoRedBoxButtons: View
+    private lateinit var btnEnableNoRedBox: AppCompatButton
+    private lateinit var btnOpenAppInfo: AppCompatButton
     private lateinit var btnGrantPermission: AppCompatButton
     private lateinit var btnToggleOverlay: AppCompatButton
 
@@ -81,8 +88,21 @@ class MainActivity : AppCompatActivity() {
         tvEngineStatus = findViewById(R.id.tvEngineStatus)
         tvCurrentConfig = findViewById(R.id.tvCurrentConfig)
         swAutoReadBoardMain = findViewById(R.id.swAutoReadBoardMain)
+        cardNoRedBoxMain = findViewById(R.id.cardNoRedBoxMain)
+        tvNoRedBoxStatus = findViewById(R.id.tvNoRedBoxStatus)
+        tvNoRedBoxHelper = findViewById(R.id.tvNoRedBoxHelper)
+        rowNoRedBoxButtons = findViewById(R.id.rowNoRedBoxButtons)
+        btnEnableNoRedBox = findViewById(R.id.btnEnableNoRedBox)
+        btnOpenAppInfo = findViewById(R.id.btnOpenAppInfo)
         btnGrantPermission = findViewById(R.id.btnGrantPermission)
         btnToggleOverlay = findViewById(R.id.btnToggleOverlay)
+
+        btnEnableNoRedBox.setOnClickListener {
+            openAccessibilitySettings()
+        }
+        btnOpenAppInfo.setOnClickListener {
+            openAppInfoSettings()
+        }
 
         swAutoReadBoardMain.isChecked = prefs.autoReadScreen
         swAutoReadBoardMain.setOnCheckedChangeListener { _, checked ->
@@ -124,12 +144,17 @@ class MainActivity : AppCompatActivity() {
 
     private fun handleAutoReadRequestIntent(intent: Intent?) {
         if (intent?.getBooleanExtra(EXTRA_REQUEST_AUTO_READ, false) == true) {
+            val forceCast = intent.getBooleanExtra(EXTRA_FORCE_FAST_CAST, false)
             intent.removeExtra(EXTRA_REQUEST_AUTO_READ)
+            intent.removeExtra(EXTRA_FORCE_FAST_CAST)
             if (Settings.canDrawOverlays(this)) {
                 prefs.autoReadScreen = true
                 swAutoReadBoardMain.isChecked = true
-                // Always request screen capture permission even when OverlayService is already running
-                requestScreenCaptureOrStartManual()
+                if (!forceCast && !prefs.useFastCastMode && ChessAccessibilityService.isConnected()) {
+                    launchOverlayServiceSilentAccessibility()
+                } else {
+                    requestScreenCaptureOrStartManual()
+                }
             } else {
                 Toast.makeText(this, "Grant Overlay Permission first", Toast.LENGTH_SHORT).show()
                 openOverlayPermissionSettings()
@@ -162,8 +187,29 @@ class MainActivity : AppCompatActivity() {
         }
 
         swAutoReadBoardMain.isChecked = prefs.autoReadScreen
+        val a11ySupported = ChessAccessibilityService.isSupportedOnDevice()
+        val a11yConnected = ChessAccessibilityService.isConnected()
+        cardNoRedBoxMain.visibility = if (a11ySupported && prefs.autoReadScreen) View.VISIBLE else View.GONE
+        if (a11yConnected && !prefs.useFastCastMode) {
+            tvNoRedBoxStatus.text = "Active ✓"
+            tvNoRedBoxStatus.setTextColor(ContextCompat.getColor(this, R.color.accent_emerald))
+            tvNoRedBoxHelper.text = "Zero red box in status bar & instant silent board reading enabled."
+            rowNoRedBoxButtons.visibility = View.GONE
+        } else if (a11yConnected && prefs.useFastCastMode) {
+            tvNoRedBoxStatus.text = "Fast Cast On"
+            tvNoRedBoxStatus.setTextColor(ContextCompat.getColor(this, R.color.accent_emerald))
+            tvNoRedBoxHelper.text = "Fast Cast Mode is enabled in Settings (shows status bar icon). Toggle it off in Settings to return to No-Red-Box mode."
+            rowNoRedBoxButtons.visibility = View.GONE
+        } else {
+            tvNoRedBoxStatus.text = "Off"
+            tvNoRedBoxStatus.setTextColor(ContextCompat.getColor(this, R.color.warning_orange))
+            tvNoRedBoxHelper.text = "First time? Tap Open App Info → 3 dots (top right) → Allow restricted settings, then switch ON ChessCoach Board Reader."
+            rowNoRedBoxButtons.visibility = View.VISIBLE
+        }
+
+        val turnTag = if (prefs.myTurnOnly) "My Turn Only" else "Both Sides"
         tvCurrentConfig.text =
-            "Elo ${prefs.targetElo} • Accuracy ${prefs.targetAccuracy}% • Depth ${prefs.searchDepth} • ${prefs.playStyle.label}"
+            "Elo ${prefs.targetElo} • ${prefs.targetAccuracy}% • Depth ${prefs.searchDepth} • $turnTag"
 
         val selectedPkg = prefs.selectedAppPackage
         val selectedName = prefs.selectedAppLabel.ifBlank { "Tap to pick app" }
@@ -247,6 +293,36 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun openAccessibilitySettings() {
+        try {
+            startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+            Toast.makeText(
+                this,
+                "Switch ON ChessCoach Board Reader (No Red Box)",
+                Toast.LENGTH_LONG
+            ).show()
+        } catch (_: Throwable) {
+            Toast.makeText(this, "Open Android Settings > Accessibility > Installed apps", Toast.LENGTH_LONG).show()
+        }
+    }
+
+    private fun openAppInfoSettings() {
+        try {
+            val intent = Intent(
+                Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                Uri.parse("package:$packageName")
+            )
+            startActivity(intent)
+            Toast.makeText(
+                this,
+                "Tap 3 dots (top right) → Allow restricted settings",
+                Toast.LENGTH_LONG
+            ).show()
+        } catch (_: Throwable) {
+            Toast.makeText(this, "Open Settings > Apps > ChessCoach Overlay", Toast.LENGTH_LONG).show()
+        }
+    }
+
     private fun startOverlayAndLaunchApp() {
         if (!Settings.canDrawOverlays(this)) {
             Toast.makeText(this, "Grant Overlay Permission first", Toast.LENGTH_SHORT).show()
@@ -255,10 +331,26 @@ class MainActivity : AppCompatActivity() {
         }
 
         if (prefs.autoReadScreen) {
-            requestScreenCaptureOrStartManual()
+            if (ChessAccessibilityService.isConnected() && !prefs.useFastCastMode) {
+                launchOverlayServiceSilentAccessibility()
+            } else {
+                requestScreenCaptureOrStartManual()
+            }
         } else {
             launchOverlayServiceAndChessApp(Activity.RESULT_CANCELED, null)
         }
+    }
+
+    private fun launchOverlayServiceSilentAccessibility() {
+        val targetPkg = prefs.selectedAppPackage
+        val serviceIntent = Intent(this, OverlayService::class.java).apply {
+            action = OverlayService.ACTION_START_OVERLAY
+            putExtra(OverlayService.EXTRA_TARGET_PACKAGE, targetPkg)
+            putExtra(OverlayService.EXTRA_LAUNCH_TARGET_APP, true)
+            putExtra(OverlayService.EXTRA_USE_ACCESSIBILITY_MODE, true)
+        }
+        ContextCompat.startForegroundService(this, serviceIntent)
+        btnToggleOverlay.postDelayed({ updateUi() }, 300L)
     }
 
     private fun requestScreenCaptureOrStartManual() {
@@ -630,5 +722,6 @@ class MainActivity : AppCompatActivity() {
     companion object {
         private const val REQ_NOTIF = 1001
         const val EXTRA_REQUEST_AUTO_READ = "extra_request_auto_read"
+        const val EXTRA_FORCE_FAST_CAST = "extra_force_fast_cast"
     }
 }

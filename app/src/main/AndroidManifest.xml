@@ -46,5 +46,19 @@
                 android:value="chess_coach_overlay" />
         </service>
 
+        <service
+            android:name=".vision.ChessAccessibilityService"
+            android:enabled="true"
+            android:exported="true"
+            android:label="@string/accessibility_service_label"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.accessibilityservice.accessibilityservice"
+                android:resource="@xml/accessibility_service_config" />
+        </service>
+
     </application>
 </manifest>

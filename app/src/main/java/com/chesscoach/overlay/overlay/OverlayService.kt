@@ -12,6 +12,7 @@ import android.content.pm.ServiceInfo
 import android.graphics.Color
 import android.graphics.PixelFormat
 import android.graphics.drawable.GradientDrawable
+import android.net.Uri
 import android.os.Build
 import android.os.Handler
 import android.os.IBinder
@@ -37,9 +38,12 @@ import com.chesscoach.overlay.engine.Move
 import com.chesscoach.overlay.engine.MoveFeedback
 import com.chesscoach.overlay.engine.Piece
 import com.chesscoach.overlay.engine.StockfishUciEngine
+import com.chesscoach.overlay.engine.TurnArrowPolicy
+import com.chesscoach.overlay.vision.AccessibilityBoardReader
 import com.chesscoach.overlay.vision.AutoReadStatusFormatter
 import com.chesscoach.overlay.vision.BoardTrackingEvent
 import com.chesscoach.overlay.vision.BoardTrackingSession
+import com.chesscoach.overlay.vision.ChessAccessibilityService
 import com.chesscoach.overlay.vision.FrameAnalysis
 import com.chesscoach.overlay.vision.PixelRect
 import com.chesscoach.overlay.vision.ScreenBoardReader
@@ -64,6 +68,7 @@ class OverlayService : Service() {
     private val mainHandler = Handler(Looper.getMainLooper())
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private var analysisJob: Job? = null
+    private var analysisGeneration: Long = 0L
 
     private val board = ChessBoard()
     private var lastAnalysis: AnalysisResult? = null
@@ -73,10 +78,12 @@ class OverlayService : Service() {
     private var currentMode: OverlayMode = OverlayMode.PASS_THROUGH
     private var overlayArrowsActive: Boolean = true
 
-    // Screen-capture auto-read state
+    // Screen-capture auto-read state (No-Red-Box Accessibility preferred, MediaProjection Cast fallback)
     private var screenBoardReader: ScreenBoardReader? = null
+    private var accessibilityBoardReader: AccessibilityBoardReader? = null
     private val trackingSession = BoardTrackingSession()
     private var hasMediaProjectionGrant: Boolean = false
+    private var usingAccessibilityCapture: Boolean = false
     private var autoBoardDetectedVisible: Boolean = false
     private var manualAlignLocked: Boolean = false
     private var lastFramesCaptured: Long = 0L
@@ -97,6 +104,22 @@ class OverlayService : Service() {
     private var settingsController: SettingsModalController? = null
     private var settingsAttached = false
 
+    private val accessibilityConnectionListener: (Boolean) -> Unit = { connected ->
+        mainHandler.post {
+            if (!isRunning) return@post
+            if (connected && prefs.autoReadScreen && !prefs.useFastCastMode && !usingAccessibilityCapture) {
+                // Seamless upgrade to Silent No-Red-Box Accessibility Mode (removes any MediaProjection red box!)
+                stopAllCapture()
+                startAsForegroundService(includeMediaProjection = false)
+                startAccessibilityCapture()
+            } else {
+                updateBoardVisibility()
+                updatePillVisualState()
+                settingsController?.syncFromPrefs()
+            }
+        }
+    }
+
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onCreate() {
@@ -109,8 +132,8 @@ class OverlayService : Service() {
         engine = StockfishUciEngine(this)
         activeTargetPackage = prefs.selectedAppPackage
 
-        // Start foreground immediately with specialUse; onStartCommand upgrades to
-        // specialUse|mediaProjection BEFORE requesting MediaProjection on Android 14+.
+        // Start foreground immediately with specialUse (ZERO red box!).
+        // Only upgrades to mediaProjection if Fast Cast Mode is explicitly started.
         startAsForegroundService(includeMediaProjection = false)
 
         if (!Settings.canDrawOverlays(this)) {
@@ -119,12 +142,13 @@ class OverlayService : Service() {
         }
 
         currentMode = if (prefs.tapInputMode) OverlayMode.TAP_MOVE else OverlayMode.PASS_THROUGH
+        ChessAccessibilityService.addConnectionListener(accessibilityConnectionListener)
 
         setupBoardOverlay()
         setupPillBar()
         applyPrefsToViews()
 
-        // Pre-initialize Stockfish binary (if bundled) in background, then run initial analysis
+        // Pre-initialize Stockfish 19 binary in background, then run initial analysis (if our turn)
         serviceScope.launch {
             withContext(Dispatchers.IO) {
                 engine.ensureInitialized()
@@ -145,16 +169,28 @@ class OverlayService : Service() {
                     activeTargetPackage = pkg
                     manualAlignLocked = false
                     screenBoardReader?.lockedScreenRect = null
+                    accessibilityBoardReader?.lockedScreenRect = null
                     reloadBoardRectForActiveApp()
                 }
 
                 val shouldLaunchTargetApp = intent.getBooleanExtra(EXTRA_LAUNCH_TARGET_APP, false)
+                val useAccessibilityRequested = intent.getBooleanExtra(EXTRA_USE_ACCESSIBILITY_MODE, false)
                 val projCode = intent.getIntExtra(EXTRA_PROJECTION_RESULT_CODE, Activity.RESULT_CANCELED)
                 val projData: Intent? = extractProjectionData(intent)
                 val incomingCaptureError = intent.getStringExtra(EXTRA_CAPTURE_ERROR)
 
-                if (projCode == Activity.RESULT_OK && projData != null && prefs.autoReadScreen) {
-                    // CRITICAL Android 14/15 lifecycle order (runs while MainActivity is still foreground):
+                if (useAccessibilityRequested && prefs.autoReadScreen && ChessAccessibilityService.isConnected()) {
+                    // Silent No-Red-Box Accessibility Mode — pure specialUse FGS, ZERO status-bar cast icon!
+                    stopAllCapture()
+                    lastCaptureError = null
+                    startAsForegroundService(includeMediaProjection = false)
+                    startAccessibilityCapture()
+                    if (shouldLaunchTargetApp) {
+                        val pkgToLaunch = activeTargetPackage
+                        mainHandler.postDelayed({ launchTargetChessApp(pkgToLaunch) }, 150L)
+                    }
+                } else if (projCode == Activity.RESULT_OK && projData != null && prefs.autoReadScreen) {
+                    // Fast Cast Mode (MediaProjection fallback):
                     // 1. Upgrade foreground service type to include MEDIA_PROJECTION FIRST
                     lastCaptureError = null
                     val fgsOk = startAsForegroundService(includeMediaProjection = true)
@@ -162,9 +198,8 @@ class OverlayService : Service() {
                         // 2. THEN call getMediaProjection -> registerCallback -> createVirtualDisplay synchronously
                         startScreenCapture(projCode, projData)
                     } else {
-                        // FGS upgrade failed; keep service alive as specialUse and surface exact error
                         startAsForegroundService(includeMediaProjection = false)
-                        stopScreenCapture()
+                        stopAllCapture()
                         Toast.makeText(
                             this,
                             "Auto-Read error: ${(lastCaptureError ?: "FGS failed").take(70)}",
@@ -180,9 +215,14 @@ class OverlayService : Service() {
                         mainHandler.postDelayed({ launchTargetChessApp(pkgToLaunch) }, 250L)
                     }
                 } else if (intent.action == ACTION_START_OVERLAY) {
-                    if (!hasMediaProjectionGrant) {
+                    if (prefs.autoReadScreen && !prefs.useFastCastMode && ChessAccessibilityService.isConnected()) {
+                        stopAllCapture()
+                        lastCaptureError = null
+                        startAsForegroundService(includeMediaProjection = false)
+                        startAccessibilityCapture()
+                    } else if (!hasActiveAutoReadCapture()) {
                         // Started without screen capture (user disabled Auto-Read or declined prompt)
-                        stopScreenCapture()
+                        stopAllCapture()
                         lastCaptureError = incomingCaptureError
                         if (!prefs.autoReadScreen) {
                             setOverlayMode(if (prefs.tapInputMode) OverlayMode.TAP_MOVE else OverlayMode.PASS_THROUGH)
@@ -202,7 +242,6 @@ class OverlayService : Service() {
                 }
             }
         }
-        // START_NOT_STICKY prevents Android from resurrecting a zombie overlay without screen permission
         return START_NOT_STICKY
     }
 
@@ -260,10 +299,10 @@ class OverlayService : Service() {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
-        val notifText = if (includeMediaProjection) {
-            "Auto-reading chess board • Offline Stockfish • ∞ moves"
-        } else {
-            getString(R.string.overlay_running_notif_text)
+        val notifText = when {
+            includeMediaProjection -> "Fast Cast auto-read • Stockfish 19 • ∞ moves"
+            usingAccessibilityCapture -> "Silent No-Red-Box mode • Stockfish 19 • ∞ moves"
+            else -> getString(R.string.overlay_running_notif_text)
         }
 
         val notification: Notification = NotificationCompat.Builder(this, CHANNEL_ID)
@@ -308,8 +347,62 @@ class OverlayService : Service() {
         }
     }
 
+    private fun startAccessibilityCapture() {
+        stopAllCapture()
+        trackingSession.resetTracking()
+        autoBoardDetectedVisible = false
+        lastFramesCaptured = 0L
+        lastDetectionBestScore = 0f
+        lastDetectionNote = ""
+        lastFrameMinLum = -1
+        lastFrameMaxLum = -1
+        lastCaptureError = null
+
+        var readerRef: AccessibilityBoardReader? = null
+        val reader = AccessibilityBoardReader(
+            context = this,
+            onFrameAnalyzed = { analysis -> handleScreenFrame(analysis) },
+            onDisconnected = {
+                usingAccessibilityCapture = false
+                hasActiveScreenCapture = hasMediaProjectionGrant && (screenBoardReader?.isActive == true)
+                autoBoardDetectedVisible = false
+                lastCaptureError = readerRef?.lastError ?: "No-Red-Box service disconnected"
+                updateBoardVisibility()
+                updatePillVisualState()
+                settingsController?.syncFromPrefs()
+            }
+        )
+        readerRef = reader
+
+        if (manualAlignLocked) {
+            boardParams?.let { bp ->
+                reader.lockedScreenRect = PixelRect(bp.x, bp.y, bp.width, bp.height)
+            }
+        }
+
+        val ok = reader.start()
+        if (ok) {
+            accessibilityBoardReader = reader
+            usingAccessibilityCapture = true
+            hasActiveScreenCapture = true
+            lastCaptureError = null
+            prefs.tapInputMode = false
+            setOverlayMode(OverlayMode.PASS_THROUGH)
+            updateBoardVisibility()
+            updatePillVisualState()
+            settingsController?.syncFromPrefs()
+        } else {
+            usingAccessibilityCapture = false
+            hasActiveScreenCapture = false
+            lastCaptureError = reader.lastError ?: "No-Red-Box service unavailable"
+            updateBoardVisibility()
+            updatePillVisualState()
+            settingsController?.syncFromPrefs()
+        }
+    }
+
     private fun startScreenCapture(resultCode: Int, projectionData: Intent) {
-        stopScreenCapture()
+        stopAllCapture()
         trackingSession.resetTracking()
         autoBoardDetectedVisible = false
         lastFramesCaptured = 0L
@@ -325,7 +418,7 @@ class OverlayService : Service() {
             onFrameAnalyzed = { analysis -> handleScreenFrame(analysis) },
             onProjectionStopped = {
                 hasMediaProjectionGrant = false
-                hasActiveScreenCapture = false
+                hasActiveScreenCapture = usingAccessibilityCapture && (accessibilityBoardReader?.isActive == true)
                 autoBoardDetectedVisible = false
                 lastCaptureError = readerRef?.lastError ?: "Screen capture stopped by Android"
                 updateBoardVisibility()
@@ -345,12 +438,11 @@ class OverlayService : Service() {
         if (ok) {
             screenBoardReader = reader
             hasMediaProjectionGrant = true
+            usingAccessibilityCapture = false
             hasActiveScreenCapture = true
             lastCaptureError = null
-            // Start cleanly in Pass-Through mode so user plays right on Chess.com immediately!
             prefs.tapInputMode = false
             setOverlayMode(OverlayMode.PASS_THROUGH)
-            // Keep board overlay hidden until an actual 8x8 chess board appears on screen
             updateBoardVisibility()
             updatePillVisualState()
             settingsController?.syncFromPrefs()
@@ -369,11 +461,16 @@ class OverlayService : Service() {
         }
     }
 
-    private fun stopScreenCapture() {
+    private fun stopAllCapture() {
+        accessibilityBoardReader?.stop()
+        accessibilityBoardReader = null
+        usingAccessibilityCapture = false
+
         screenBoardReader?.stop()
         screenBoardReader = null
         hasMediaProjectionGrant = false
         hasActiveScreenCapture = false
+
         autoBoardDetectedVisible = false
         lastFramesCaptured = 0L
         lastDetectionBestScore = 0f
@@ -383,8 +480,13 @@ class OverlayService : Service() {
         trackingSession.resetTracking()
     }
 
+    private fun hasActiveAutoReadCapture(): Boolean {
+        return (usingAccessibilityCapture && accessibilityBoardReader?.isActive == true) ||
+            (hasMediaProjectionGrant && screenBoardReader?.isActive == true)
+    }
+
     private fun isAutoReadLive(): Boolean {
-        return prefs.autoReadScreen && hasMediaProjectionGrant && (screenBoardReader?.isActive == true)
+        return prefs.autoReadScreen && hasActiveAutoReadCapture()
     }
 
     private fun handleScreenFrame(analysis: FrameAnalysis) {
@@ -409,7 +511,8 @@ class OverlayService : Service() {
         val events = trackingSession.onFrame(
             analysis = analysis,
             currentBoard = board,
-            currentPlayingAsWhite = prefs.playingAsWhite
+            currentPlayingAsWhite = prefs.playingAsWhite,
+            singleFrameMoveConfirm = usingAccessibilityCapture
         )
 
         for (ev in events) {
@@ -442,7 +545,8 @@ class OverlayService : Service() {
                     applyPrefsToViews()
                     updateBoardVisibility()
                     updatePillVisualState()
-                    refreshBoardView(analyzing = false)
+                    // Re-evaluate turn ownership (immediately hides opponent arrows or starts Stockfish for player's turn)
+                    triggerAnalysis()
                 }
                 is BoardTrackingEvent.NewGameDetected -> {
                     autoBoardDetectedVisible = true
@@ -495,7 +599,7 @@ class OverlayService : Service() {
 
     private fun applyAutoDetectedMoves(moves: List<Move>) {
         if (moves.isEmpty()) return
-        val playerColor = if (prefs.playingAsWhite) Piece.WHITE else Piece.BLACK
+        val playerColor = TurnArrowPolicy.myColor(prefs.playingAsWhite)
         var gradeBefore: ChessBoard? = null
         var gradedMove: Move? = null
         val cachedBestBefore = lastAnalysis?.topMoves?.firstOrNull()
@@ -515,7 +619,8 @@ class OverlayService : Service() {
             lastFeedback = null
         }
 
-        refreshBoardView(analyzing = true)
+        val myTurnNow = TurnArrowPolicy.shouldShowArrow(prefs.myTurnOnly, board.sideToMove, prefs.playingAsWhite)
+        refreshBoardView(analyzing = myTurnNow)
         triggerAnalysis(
             gradeBefore = gradeBefore,
             gradedMove = gradedMove,
@@ -524,14 +629,27 @@ class OverlayService : Service() {
     }
 
     private fun syncActiveArrowMask() {
-        val reader = screenBoardReader ?: return
         val arrowVisible = overlayArrowsActive &&
             prefs.showArrows &&
             currentMode != OverlayMode.ALIGN &&
             !settingsAttached &&
             (autoBoardDetectedVisible || manualAlignLocked || !isAutoReadLive())
-        reader.activeArrow = if (arrowVisible) lastAnalysis?.topMoves?.firstOrNull()?.move else null
-        reader.activeArrowPlayingAsWhite = prefs.playingAsWhite
+        val displayAnalysis = TurnArrowPolicy.filterAnalysisForDisplay(
+            analysis = lastAnalysis,
+            myTurnOnly = prefs.myTurnOnly,
+            sideToMove = board.sideToMove,
+            playingAsWhite = prefs.playingAsWhite
+        )
+        val activeMove = if (arrowVisible) displayAnalysis?.topMoves?.firstOrNull()?.move else null
+
+        screenBoardReader?.let { reader ->
+            reader.activeArrow = activeMove
+            reader.activeArrowPlayingAsWhite = prefs.playingAsWhite
+        }
+        accessibilityBoardReader?.let { reader ->
+            reader.activeArrow = activeMove
+            reader.activeArrowPlayingAsWhite = prefs.playingAsWhite
+        }
     }
 
     private fun updateBoardVisibility() {
@@ -672,7 +790,9 @@ class OverlayService : Service() {
             )
             manualAlignLocked = true
             autoBoardDetectedVisible = true
-            screenBoardReader?.lockedScreenRect = PixelRect(bp.x, bp.y, bp.width, bp.height)
+            val lockedRect = PixelRect(bp.x, bp.y, bp.width, bp.height)
+            screenBoardReader?.lockedScreenRect = lockedRect
+            accessibilityBoardReader?.lockedScreenRect = lockedRect
         }
         val nextMode = if (prefs.tapInputMode) OverlayMode.TAP_MOVE else OverlayMode.PASS_THROUGH
         setOverlayMode(nextMode)
@@ -713,7 +833,6 @@ class OverlayService : Service() {
         val btnSettings = view.findViewById<ImageButton>(R.id.btnPillSettings)
         val btnClose = view.findViewById<ImageButton>(R.id.btnPillClose)
 
-        // Allow dragging from anywhere on the 3-button pill bar while keeping taps crisp
         view.setOnTouchListener(createDragOrClickListener(onClick = null))
         playContainer.setOnTouchListener(createDragOrClickListener {
             overlayArrowsActive = !overlayArrowsActive
@@ -805,11 +924,9 @@ class OverlayService : Service() {
         val playIcon = ivPillPlay
         if (playIcon != null) {
             if (overlayArrowsActive) {
-                // RUNNING / ARROWS ON: crisp white || (tap to pause), matching reference pill
                 playIcon.setImageResource(R.drawable.ic_pause)
                 playIcon.setColorFilter(Color.parseColor("#F8FAFC"))
             } else {
-                // PAUSED / ARROWS OFF: muted grey ▶ (tap to resume)
                 playIcon.setImageResource(R.drawable.ic_play)
                 playIcon.setColorFilter(Color.parseColor("#94A3B8"))
             }
@@ -836,7 +953,7 @@ class OverlayService : Service() {
         return AutoReadStatusFormatter.formatStatus(
             autoReadEnabled = prefs.autoReadScreen,
             autoReadLive = isAutoReadLive(),
-            hasMediaProjectionGrant = hasMediaProjectionGrant,
+            hasMediaProjectionGrant = hasActiveAutoReadCapture(),
             boardVisibleOrLocked = autoBoardDetectedVisible || manualAlignLocked,
             playingAsWhite = prefs.playingAsWhite,
             fullMoveNumber = board.fullMoveNumber,
@@ -844,14 +961,21 @@ class OverlayService : Service() {
             bestScore = lastDetectionBestScore,
             lastCaptureError = lastCaptureError,
             tapInputMode = prefs.tapInputMode,
-            frameMaxLum = lastFrameMaxLum
+            frameMaxLum = lastFrameMaxLum,
+            usingAccessibilityMode = usingAccessibilityCapture
         )
     }
 
-    private fun launchGrantScreenPermissionActivity() {
+    private fun launchGrantScreenPermissionActivity(forceFastCast: Boolean = false) {
         overlayArrowsActive = true
         updatePillVisualState()
         hideSettingsModal()
+        if (!forceFastCast && !prefs.useFastCastMode && ChessAccessibilityService.isConnected()) {
+            startAsForegroundService(includeMediaProjection = false)
+            startAccessibilityCapture()
+            Toast.makeText(this, "No-Red-Box mode active!", Toast.LENGTH_SHORT).show()
+            return
+        }
         Toast.makeText(
             this,
             "Opening Screen Capture permission…",
@@ -860,9 +984,45 @@ class OverlayService : Service() {
         val i = Intent(this, MainActivity::class.java).apply {
             flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP
             putExtra(MainActivity.EXTRA_REQUEST_AUTO_READ, true)
+            putExtra(MainActivity.EXTRA_FORCE_FAST_CAST, forceFastCast)
         }
         try {
             startActivity(i)
+        } catch (_: Throwable) {
+        }
+    }
+
+    private fun openAccessibilitySettingsFromOverlay() {
+        hideSettingsModal()
+        val intent = Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS).apply {
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK
+        }
+        try {
+            startActivity(intent)
+            Toast.makeText(
+                this,
+                "Switch ON ChessCoach Board Reader (No Red Box)",
+                Toast.LENGTH_LONG
+            ).show()
+        } catch (_: Throwable) {
+        }
+    }
+
+    private fun openAppInfoFromOverlay() {
+        hideSettingsModal()
+        val intent = Intent(
+            Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+            Uri.parse("package:$packageName")
+        ).apply {
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK
+        }
+        try {
+            startActivity(intent)
+            Toast.makeText(
+                this,
+                "Tap 3 dots (top right) → Allow restricted settings",
+                Toast.LENGTH_LONG
+            ).show()
         } catch (_: Throwable) {
         }
     }
@@ -882,7 +1042,7 @@ class OverlayService : Service() {
             prefs = prefs,
             engineNameProvider = { engine.activeEngineName },
             screenReadStatusProvider = { describeScreenReadStatus() },
-            needsScreenPermissionProvider = { prefs.autoReadScreen && !hasMediaProjectionGrant },
+            needsScreenPermissionProvider = { prefs.autoReadScreen && !hasActiveAutoReadCapture() },
             onSettingsChanged = { reanalyze ->
                 applyPrefsToViews()
                 if (reanalyze) {
@@ -892,15 +1052,33 @@ class OverlayService : Service() {
                 }
             },
             onAutoReadToggled = { enabled ->
-                if (enabled && !hasMediaProjectionGrant) {
-                    launchGrantScreenPermissionActivity()
+                if (enabled && !hasActiveAutoReadCapture()) {
+                    launchGrantScreenPermissionActivity(forceFastCast = prefs.useFastCastMode)
                 } else if (!enabled) {
                     lastCaptureError = null
-                    stopScreenCapture()
+                    stopAllCapture()
+                    startAsForegroundService(includeMediaProjection = false)
                     updateBoardVisibility()
                     updatePillVisualState()
                 }
             },
+            onFastCastModeToggled = { useFastCast ->
+                if (prefs.autoReadScreen) {
+                    if (useFastCast) {
+                        if (!hasMediaProjectionGrant) {
+                            stopAllCapture()
+                            launchGrantScreenPermissionActivity(forceFastCast = true)
+                        }
+                    } else if (ChessAccessibilityService.isConnected()) {
+                        stopAllCapture()
+                        startAsForegroundService(includeMediaProjection = false)
+                        startAccessibilityCapture()
+                        Toast.makeText(this, "Switched to No-Red-Box mode", Toast.LENGTH_SHORT).show()
+                    }
+                }
+            },
+            onEnableNoRedBoxClicked = { openAccessibilitySettingsFromOverlay() },
+            onOpenAppInfoClicked = { openAppInfoFromOverlay() },
             onTapInputToggled = { tapEnabled ->
                 setOverlayMode(if (tapEnabled) OverlayMode.TAP_MOVE else OverlayMode.PASS_THROUGH)
             },
@@ -911,7 +1089,7 @@ class OverlayService : Service() {
             onFlipClicked = {
                 prefs.playingAsWhite = !prefs.playingAsWhite
                 applyPrefsToViews()
-                refreshBoardView(analyzing = false)
+                triggerAnalysis()
             },
             onUndoClicked = {
                 if (board.undoLastMove() != null) {
@@ -922,11 +1100,12 @@ class OverlayService : Service() {
             onNewGameClicked = { resetGame() },
             onRedetectClicked = {
                 overlayArrowsActive = true
-                if (prefs.autoReadScreen && !hasMediaProjectionGrant) {
-                    launchGrantScreenPermissionActivity()
+                if (prefs.autoReadScreen && !hasActiveAutoReadCapture()) {
+                    launchGrantScreenPermissionActivity(forceFastCast = prefs.useFastCastMode)
                 } else {
                     manualAlignLocked = false
                     screenBoardReader?.lockedScreenRect = null
+                    accessibilityBoardReader?.lockedScreenRect = null
                     trackingSession.resetTracking()
                     autoBoardDetectedVisible = false
                     hideSettingsModal()
@@ -990,7 +1169,7 @@ class OverlayService : Service() {
 
         if (!board.pushMove(move)) return
 
-        val playerColor = if (prefs.playingAsWhite) Piece.WHITE else Piece.BLACK
+        val playerColor = TurnArrowPolicy.myColor(prefs.playingAsWhite)
         val shouldGrade = prefs.analyzeMyMoves && mover == playerColor
 
         lastAnalysis = null
@@ -998,7 +1177,8 @@ class OverlayService : Service() {
             lastFeedback = null
         }
 
-        refreshBoardView(analyzing = true)
+        val myTurnNow = TurnArrowPolicy.shouldShowArrow(prefs.myTurnOnly, board.sideToMove, prefs.playingAsWhite)
+        refreshBoardView(analyzing = myTurnNow)
         triggerAnalysis(
             gradeBefore = if (shouldGrade) boardBefore else null,
             gradedMove = if (shouldGrade) move else null,
@@ -1019,6 +1199,7 @@ class OverlayService : Service() {
         gradedMove: Move? = null,
         cachedBestBefore: com.chesscoach.overlay.engine.ScoredMove? = null
     ) {
+        val gen = ++analysisGeneration
         engine.cancel()
         analysisJob?.cancel()
 
@@ -1027,6 +1208,28 @@ class OverlayService : Service() {
         val acc = prefs.targetAccuracy
         val depth = prefs.searchDepth
         val style = prefs.playStyle
+        val playingWhiteAtStart = prefs.playingAsWhite
+        val myTurnOnlyAtStart = prefs.myTurnOnly
+
+        // MY TURN ONLY: never draw arrows or run best-move search for the opponent's pieces!
+        if (!TurnArrowPolicy.shouldShowArrow(myTurnOnlyAtStart, boardCopy.sideToMove, playingWhiteAtStart)) {
+            lastAnalysis = null
+            boardView?.setAnalysis(null)
+            refreshBoardView(analyzing = false)
+
+            // Still grade the player's move that just finished if requested (without showing any opponent arrow)
+            if (gradeBefore != null && gradedMove != null) {
+                analysisJob = serviceScope.launch {
+                    val fb = withContext(Dispatchers.Default) {
+                        engine.evaluateMoveQuality(gradeBefore, gradedMove, cachedBestBefore, depth = 3)
+                    }
+                    if (!isActive || gen != analysisGeneration) return@launch
+                    lastFeedback = fb
+                    refreshBoardView(analyzing = false)
+                }
+            }
+            return
+        }
 
         refreshBoardView(analyzing = true)
 
@@ -1043,34 +1246,59 @@ class OverlayService : Service() {
                     searchDepth = depth,
                     targetAccuracy = acc,
                     playStyle = style,
-                    multiPv = 3
+                    multiPv = 3,
+                    onInterimResult = { interim ->
+                        mainHandler.post {
+                            if (!isRunning || gen != analysisGeneration) return@post
+                            if (!TurnArrowPolicy.shouldShowArrow(
+                                    prefs.myTurnOnly,
+                                    board.sideToMove,
+                                    prefs.playingAsWhite
+                                )
+                            ) {
+                                return@post
+                            }
+                            lastAnalysis = interim
+                            refreshBoardView(analyzing = true)
+                        }
+                    }
                 )
                 fb to res
             }
-            if (!isActive) return@launch
+            if (!isActive || gen != analysisGeneration) return@launch
             if (feedback != null) {
                 lastFeedback = feedback
             }
-            lastAnalysis = result
+            if (TurnArrowPolicy.shouldShowArrow(prefs.myTurnOnly, board.sideToMove, prefs.playingAsWhite)) {
+                lastAnalysis = result
+            } else {
+                lastAnalysis = null
+            }
             refreshBoardView(analyzing = false)
         }
     }
 
     private fun refreshBoardView(analyzing: Boolean) {
-        val playerColor = if (prefs.playingAsWhite) Piece.WHITE else Piece.BLACK
+        val playerColor = TurnArrowPolicy.myColor(prefs.playingAsWhite)
         val pins = board.findPinnedSquares(Piece.WHITE) + board.findPinnedSquares(Piece.BLACK)
         val warnings = board.findBoardWarnings(playerColor)
         val risks = board.findLineRisks(playerColor)
         val status = board.getGameStatus()
+        val displayAnalysis = TurnArrowPolicy.filterAnalysisForDisplay(
+            analysis = lastAnalysis,
+            myTurnOnly = prefs.myTurnOnly,
+            sideToMove = board.sideToMove,
+            playingAsWhite = prefs.playingAsWhite
+        )
 
         boardView?.updateState(
             board = board,
-            analysisResult = lastAnalysis,
+            analysisResult = displayAnalysis,
             pins = pins,
             boardWarnings = warnings,
             feedback = lastFeedback,
             status = status,
-            analyzing = analyzing,
+            analyzing = analyzing && (displayAnalysis != null || TurnArrowPolicy.shouldShowArrow(prefs.myTurnOnly, board.sideToMove, prefs.playingAsWhite)),
             risks = risks
         )
         syncActiveArrowMask()
@@ -1079,8 +1307,9 @@ class OverlayService : Service() {
     override fun onDestroy() {
         isRunning = false
         hasActiveScreenCapture = false
+        ChessAccessibilityService.removeConnectionListener(accessibilityConnectionListener)
         mainHandler.removeCallbacksAndMessages(null)
-        stopScreenCapture()
+        stopAllCapture()
         analysisJob?.cancel()
         engine.close()
         serviceScope.cancel()
@@ -1108,6 +1337,7 @@ class OverlayService : Service() {
         const val ACTION_UPDATE_TARGET_APP = "com.chesscoach.overlay.ACTION_UPDATE_TARGET_APP"
         const val EXTRA_TARGET_PACKAGE = "extra_target_package"
         const val EXTRA_LAUNCH_TARGET_APP = "extra_launch_target_app"
+        const val EXTRA_USE_ACCESSIBILITY_MODE = "extra_use_accessibility_mode"
         const val EXTRA_PROJECTION_RESULT_CODE = "extra_projection_result_code"
         const val EXTRA_PROJECTION_DATA = "extra_projection_data"
         const val EXTRA_CAPTURE_ERROR = "extra_capture_error"

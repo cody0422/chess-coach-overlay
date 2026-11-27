@@ -92,15 +92,14 @@ jobs:
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v2.3.0
-          name: ChessCoachOverlay v2.3.0
+          tag_name: v2.4.0
+          name: ChessCoachOverlay v2.4.0
           body: |
-            ## ChessCoachOverlay v2.3.0
-            - **Upgraded to Stockfish 19 (ARM64 NNUE):** Compiled directly from official `sf_19` with embedded NNUE network + pure-Kotlin fallback, adjustable **400–4000 Elo**, **50%–100% Accuracy**, **Depth 1–8**, and **∞ Unlimited Moves/Day**
-            - **Crisp Slim Black Best-Move Arrow:** Sleek black vector arrow (`#E60B0F14` with subtle crisp `#CCF8FAFC` outer outline) matching clean slim proportions that pops razor-sharp on both dark and light themes — with built-in arrow-corridor self-masking so auto-read never misreads the arrow as a piece
-            - **Fixed Pill Play/Pause Button:** Shows crisp white `||` while running (tap to pause) and muted grey `▶` while paused (tap to resume), with instant ON/PAUSED toast feedback
-            - **Textured Ocean Theme & Automatic White/Black Detection:** Tightened inner-square piece sampling (`0.25..0.75`) and theme-adaptive foreground thresholds for 64/64 clean classification on Ocean/wave/textured Chess.com themes, plus automatic White/Black orientation detection without ever needing to tap Flip
-            - **Smarter Telemetry & Auto-Hide Re-Detect:** Preserves pre-Settings scan telemetry while Settings is open, detects blank frames (`frameMaxLum < 12`), and auto-hides Settings on **Re-Detect** for instant board lock
+            ## ChessCoachOverlay v2.4.0
+            - **Your Pieces Only (`My Turn Only` on by default):** Arrows vanish smoothly on your opponent's turn and pop back the instant they move — works automatically whether you're playing White or Black (configurable in Settings)
+            - **Zero Red Box in Status Bar (No-Red-Box Accessibility Mode):** Silent `AccessibilityService.takeScreenshot()` board reading removes Android's red screen-cast status-bar icon and removes the "Start now" prompt every launch, with event-driven instant move detection, 1-frame move confirmation, and a 1-tap Samsung Android 15 setup card (plus optional Fast Cast Mode fallback in Settings)
+            - **Live-Streaming Stockfish 19 (~50ms First Arrow) + 60fps Animated Arrow:** Streams Stockfish 19's first best move live as it searches instead of waiting for full search completion, paired with silky 60fps glide/fade animations on the sleek black arrow
+            - **Built on v2.3.0:** Official **Stockfish 19 (`sf_19` ARM64 NNUE)**, 64/64 Ocean/textured theme board reader, black-arrow self-masking, automatic White/Black orientation detection, and fixed pill Play/Pause icon
           files: |
             ChessCoachOverlay.apk
           make_latest: true

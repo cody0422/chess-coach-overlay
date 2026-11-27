@@ -411,7 +411,7 @@ class ScreenBoardReader(
 
     companion object {
         private const val TARGET_CAPTURE_WIDTH = 540
-        private const val POLL_INTERVAL_MS = 450L
+        private const val POLL_INTERVAL_MS = 220L
         private const val INITIAL_DELAY_MS = 350L
     }
 }
