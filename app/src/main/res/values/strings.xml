@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">ChessCoach Overlay</string>
+    <string name="unlimited_badge">∞ Unlimited Moves</string>
+    <string name="settings_title">Settings</string>
+    <string name="grant_overlay_permission">Grant Overlay Permission</string>
+    <string name="start_overlay">Start Overlay</string>
+    <string name="stop_overlay">Stop Overlay</string>
+    <string name="overlay_running_notif_title">ChessCoach Overlay Active</string>
+    <string name="overlay_running_notif_text">Offline chess engine running • Unlimited moves</string>
+    <string name="notif_channel_name">Chess Coach Overlay</string>
+</resources>

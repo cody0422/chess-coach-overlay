@@ -1,0 +1,105 @@
+name: Build ChessCoachOverlay APK
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Set up Gradle 8.7
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+
+      - name: Build Stockfish 17 for Android arm64-v8a (optional native engine)
+        id: build_stockfish
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          NDK_DIR="${ANDROID_NDK_LATEST_HOME:-${ANDROID_NDK_HOME:-}}"
+          if [ -z "$NDK_DIR" ] && [ -n "${ANDROID_HOME:-}" ] && [ -d "${ANDROID_HOME}/ndk" ]; then
+            NDK_DIR=$(ls -d "${ANDROID_HOME}"/ndk/* 2>/dev/null | sort -V | tail -n 1 || true)
+          fi
+          if [ -z "$NDK_DIR" ] || [ ! -d "$NDK_DIR" ]; then
+            echo "Android NDK not found; falling back to pure-Kotlin engine."
+            exit 1
+          fi
+          CXX="$NDK_DIR/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android26-clang++"
+          STRIP="$NDK_DIR/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip"
+          if [ ! -x "$CXX" ]; then
+            echo "NDK clang++ not found at $CXX; falling back to pure-Kotlin engine."
+            exit 1
+          fi
+
+          rm -rf /tmp/Stockfish
+          if ! git clone --depth 1 --branch sf_17 https://github.com/official-stockfish/Stockfish.git /tmp/Stockfish; then
+            git clone --depth 1 https://github.com/official-stockfish/Stockfish.git /tmp/Stockfish
+          fi
+
+          cd /tmp/Stockfish/src
+          make net
+
+          SRCS=$(find . -name '*.cpp' ! -path './test*' | tr '\n' ' ')
+          echo "Compiling Stockfish sources with $CXX..."
+          "$CXX" -O3 -std=c++17 -DNDEBUG -DUSE_NEON=8 -DIS_64BIT             -fno-exceptions -pthread -static-libstdc++             -I. $SRCS -lm -o libstockfish.so
+
+          if [ -x "$STRIP" ]; then
+            "$STRIP" --strip-unneeded libstockfish.so || true
+          fi
+
+          FILE_INFO=$(file libstockfish.so)
+          echo "Built binary info: $FILE_INFO"
+          echo "$FILE_INFO" | grep -qi "ARM aarch64"
+
+          mkdir -p "$GITHUB_WORKSPACE/app/src/main/jniLibs/arm64-v8a"
+          cp libstockfish.so "$GITHUB_WORKSPACE/app/src/main/jniLibs/arm64-v8a/libstockfish.so"
+          ls -lh "$GITHUB_WORKSPACE/app/src/main/jniLibs/arm64-v8a/libstockfish.so"
+
+      - name: Run Unit Tests and Assemble Debug APK
+        run: |
+          gradle testDebugUnitTest assembleDebug --no-daemon --stacktrace
+
+      - name: Prepare ChessCoachOverlay.apk
+        shell: bash
+        run: |
+          cp app/build/outputs/apk/debug/app-debug.apk ChessCoachOverlay.apk
+          ls -lh ChessCoachOverlay.apk
+
+      - name: Upload APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ChessCoachOverlay-APK
+          path: ChessCoachOverlay.apk
+          retention-days: 90
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v1.0.0
+          name: ChessCoachOverlay v1.0.0
+          body: |
+            ## ChessCoachOverlay v1.0.0
+            - Floating dark chess coach overlay (`SYSTEM_ALERT_WINDOW`) with draggable pill bar & resizable 8x8 board frame
+            - Adjustable target Elo slider (**400 to 4000 Elo**, step 50) + search depth slider (1–8)
+            - **Infinite moves/day** — 100% offline engine (bundled Stockfish 17 arm64 with automatic pure-Kotlin fallback)
+            - Best-move emerald arrows, evaluation bar, move quality feedback, board warnings, pinned piece highlights, and pass-through touch toggle
+          files: |
+            ChessCoachOverlay.apk
+          make_latest: true
