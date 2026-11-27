@@ -589,11 +589,13 @@ object BoardVisionAnalyzer {
             }
         }
 
-        if (midOccupied <= 2) {
-            if (topBlack >= 13 && botWhite >= 13) {
+        // Require zero pieces in middle 4 ranks so opening moves (1. e4, 1. Nf3, etc.)
+        // are NEVER misread as the starting position.
+        if (midOccupied == 0) {
+            if (topBlack >= 15 && botWhite >= 15) {
                 return StartPositionDetection(isStartPosition = true, playingAsWhite = true)
             }
-            if (topWhite >= 13 && botBlack >= 13) {
+            if (topWhite >= 15 && botBlack >= 15) {
                 return StartPositionDetection(isStartPosition = true, playingAsWhite = false)
             }
         }
@@ -660,7 +662,8 @@ object BoardVisionAnalyzer {
             }
         }
 
-        if (best1Move != null && best1Score >= 61 && best1Score >= currentScore + 2) {
+        // If 1-ply move is an exact or near-exact match (63-64/64), return immediately
+        if (best1Move != null && best1Score >= 63 && best1Score >= currentScore + 2) {
             return LegalMoveMatch(listOf(best1Move), best1Score, currentScore)
         }
 
@@ -689,11 +692,15 @@ object BoardVisionAnalyzer {
         }
 
         if (best2M1 != null && best2M2 != null &&
-            best2Score >= 61 &&
+            best2Score >= 62 &&
             best2Score >= currentScore + 3 &&
-            best2Score > best1Score
+            best2Score >= best1Score + 2
         ) {
             return LegalMoveMatch(listOf(best2M1, best2M2), best2Score, currentScore)
+        }
+
+        if (best1Move != null && best1Score >= 61 && best1Score >= currentScore + 2) {
+            return LegalMoveMatch(listOf(best1Move), best1Score, currentScore)
         }
 
         return null
