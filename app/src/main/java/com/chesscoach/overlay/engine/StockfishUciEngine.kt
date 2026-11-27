@@ -110,7 +110,7 @@ object StockfishUciParser {
 
     fun parseInfoLine(line: String, legalMoves: List<Move>): ParsedUciInfo? {
         if (!line.startsWith("info ") || !line.contains(" pv ")) return null
-        val tokens = line.trim().split(Regex("\s+"))
+        val tokens = line.trim().split(Regex("\\s+"))
         var depth = 0
         var multiPv = 1
         var nodes = 0L
@@ -375,8 +375,7 @@ class StockfishUciEngine(private val context: Context) {
         if (searching.get()) {
             try {
                 writer?.let {
-                    it.write("stop
-")
+                    it.write("stop\n")
                     it.flush()
                 }
             } catch (_: Throwable) {
@@ -620,8 +619,7 @@ class StockfishUciEngine(private val context: Context) {
     private fun sendLineLocked(cmd: String) {
         val w = writer ?: throw IllegalStateException("Stockfish writer closed")
         w.write(cmd)
-        w.write("
-")
+        w.write("\n")
         w.flush()
     }
 
@@ -638,8 +636,7 @@ class StockfishUciEngine(private val context: Context) {
     private fun destroyProcessLocked() {
         resetCachedOptionsLocked()
         try {
-            writer?.write("quit
-")
+            writer?.write("quit\n")
             writer?.flush()
         } catch (_: Throwable) {
         }
