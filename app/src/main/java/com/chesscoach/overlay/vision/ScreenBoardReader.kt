@@ -28,6 +28,7 @@ import kotlin.math.min
  *    latestPixels buffer (closing Image in finally {}), and the 450ms capture tick re-analyzes
  *    latestPixels even on static screens (e.g. offline/bot games without a ticking clock) so
  *    BoardTrackingSession never starves for consecutive frames.
+ * 5. Never silently swallows setup or revocation errors — exposes exact stage + exception in lastError.
  */
 class ScreenBoardReader(
     private val context: Context,
@@ -59,11 +60,17 @@ class ScreenBoardReader(
     @Volatile
     var lockedScreenRect: PixelRect? = null
 
+    @Volatile
+    var lastError: String? = null
+        private set
+
     val isActive: Boolean
         get() = running.get()
 
     private val projectionCallback = object : MediaProjection.Callback() {
         override fun onStop() {
+            if (!running.get()) return
+            lastError = "Screen capture stopped by Android"
             stop()
             onProjectionStopped()
         }
@@ -85,16 +92,27 @@ class ScreenBoardReader(
 
     fun start(resultCode: Int, projectionData: Intent): Boolean {
         stop()
+        lastError = null
 
         val projectionManager =
             context.getSystemService(Context.MEDIA_PROJECTION_SERVICE) as? MediaProjectionManager
-                ?: return false
+        if (projectionManager == null) {
+            lastError = "MediaProjectionManager unavailable"
+            return false
+        }
 
         val mp = try {
             projectionManager.getMediaProjection(resultCode, projectionData)
-        } catch (_: Throwable) {
+        } catch (t: Throwable) {
+            lastError = formatError("getMediaProjection", t)
             null
-        } ?: return false
+        }
+        if (mp == null) {
+            if (lastError == null) {
+                lastError = "getMediaProjection returned null"
+            }
+            return false
+        }
 
         // Compute full physical screen dimensions so detected rects match FLAG_LAYOUT_IN_SCREEN
         val (fullW, fullH, dpi) = queryPhysicalScreenMetrics()
@@ -118,10 +136,12 @@ class ScreenBoardReader(
         bgHandler = handler
         mediaProjection = mp
 
+        var stage = "registerCallback"
         try {
             // CRITICAL Android 14 (API 34) requirement: registerCallback BEFORE createVirtualDisplay
             mp.registerCallback(projectionCallback, mainHandler)
 
+            stage = "ImageReader"
             val reader = ImageReader.newInstance(capWidth, capHeight, PixelFormat.RGBA_8888, 2)
             reader.setOnImageAvailableListener({ r ->
                 try {
@@ -132,6 +152,7 @@ class ScreenBoardReader(
             imageReader = reader
             running.set(true)
 
+            stage = "createVirtualDisplay"
             val vd = mp.createVirtualDisplay(
                 "ChessBoardCapture",
                 capWidth,
@@ -143,13 +164,15 @@ class ScreenBoardReader(
                 handler
             )
             if (vd == null) {
+                lastError = "createVirtualDisplay returned null"
                 stop()
                 return false
             }
             virtualDisplay = vd
             handler.postDelayed(captureRunnable, INITIAL_DELAY_MS)
             return true
-        } catch (_: Throwable) {
+        } catch (t: Throwable) {
+            lastError = formatError(stage, t)
             stop()
             return false
         }
@@ -330,6 +353,15 @@ class ScreenBoardReader(
                 if (dm.heightPixels > 0) dm.heightPixels else context.resources.displayMetrics.heightPixels,
                 dpi
             )
+        }
+    }
+
+    private fun formatError(stage: String, t: Throwable): String {
+        val msg = t.message?.trim().orEmpty()
+        return if (msg.isNotEmpty()) {
+            "$stage: ${t.javaClass.simpleName}: $msg"
+        } else {
+            "$stage: ${t.javaClass.simpleName}"
         }
     }
 

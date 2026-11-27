@@ -1188,3 +1188,53 @@ class BoardTrackingSession {
         return events
     }
 }
+/**
+ * Pure-Kotlin formatter for the Settings Auto-Read status banner and action button label.
+ * Kept Android-free so every state branch is directly covered by JVM unit tests.
+ */
+object AutoReadStatusFormatter {
+    fun formatStatus(
+        autoReadEnabled: Boolean,
+        autoReadLive: Boolean,
+        hasMediaProjectionGrant: Boolean,
+        boardVisibleOrLocked: Boolean,
+        playingAsWhite: Boolean,
+        fullMoveNumber: Int,
+        framesCaptured: Long,
+        bestScore: Float,
+        lastCaptureError: String?,
+        tapInputMode: Boolean
+    ): String {
+        return when {
+            autoReadLive && boardVisibleOrLocked -> {
+                val side = if (playingAsWhite) "White" else "Black"
+                "Auto-Read: Locked ($side · move $fullMoveNumber)"
+            }
+            autoReadLive && framesCaptured == 0L ->
+                "Auto-Read: Waiting for screen frames..."
+            autoReadLive -> {
+                val bestPct = (bestScore * 100f).toInt().coerceIn(0, 100)
+                "Auto-Read: Scanning (${framesCaptured}f · best $bestPct%) — open a game"
+            }
+            autoReadEnabled && !hasMediaProjectionGrant && !lastCaptureError.isNullOrBlank() ->
+                "Auto-Read error: ${lastCaptureError.take(90)}"
+            autoReadEnabled && !hasMediaProjectionGrant ->
+                "Auto-Read: Needs screen permission (tap Grant Access)"
+            tapInputMode ->
+                "Manual Tap Mode (tap moves on board)"
+            else ->
+                "Manual Pass-Through Mode"
+        }
+    }
+
+    fun actionButtonLabel(
+        autoReadEnabled: Boolean,
+        hasMediaProjectionGrant: Boolean
+    ): String {
+        return if (autoReadEnabled && !hasMediaProjectionGrant) {
+            "Grant Access"
+        } else {
+            "Re-Detect"
+        }
+    }
+}

@@ -13,7 +13,9 @@ import android.graphics.Color
 import android.graphics.PixelFormat
 import android.graphics.drawable.GradientDrawable
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import android.provider.Settings
 import android.view.ContextThemeWrapper
 import android.view.Gravity
@@ -35,6 +37,7 @@ import com.chesscoach.overlay.engine.Move
 import com.chesscoach.overlay.engine.MoveFeedback
 import com.chesscoach.overlay.engine.Piece
 import com.chesscoach.overlay.engine.StockfishUciEngine
+import com.chesscoach.overlay.vision.AutoReadStatusFormatter
 import com.chesscoach.overlay.vision.BoardTrackingEvent
 import com.chesscoach.overlay.vision.BoardTrackingSession
 import com.chesscoach.overlay.vision.FrameAnalysis
@@ -58,6 +61,7 @@ class OverlayService : Service() {
     private lateinit var prefs: OverlayPrefs
     private lateinit var engine: StockfishUciEngine
 
+    private val mainHandler = Handler(Looper.getMainLooper())
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private var analysisJob: Job? = null
 
@@ -78,6 +82,7 @@ class OverlayService : Service() {
     private var lastFramesCaptured: Long = 0L
     private var lastDetectionBestScore: Float = 0f
     private var lastDetectionNote: String = ""
+    private var lastCaptureError: String? = null
 
     private var boardView: BoardOverlayView? = null
     private var boardParams: WindowManager.LayoutParams? = null
@@ -141,31 +146,76 @@ class OverlayService : Service() {
                     reloadBoardRectForActiveApp()
                 }
 
+                val shouldLaunchTargetApp = intent.getBooleanExtra(EXTRA_LAUNCH_TARGET_APP, false)
                 val projCode = intent.getIntExtra(EXTRA_PROJECTION_RESULT_CODE, Activity.RESULT_CANCELED)
                 val projData: Intent? = extractProjectionData(intent)
+                val incomingCaptureError = intent.getStringExtra(EXTRA_CAPTURE_ERROR)
 
                 if (projCode == Activity.RESULT_OK && projData != null && prefs.autoReadScreen) {
-                    // CRITICAL Android 14 (API 34) lifecycle order:
+                    // CRITICAL Android 14/15 lifecycle order (runs while MainActivity is still foreground):
                     // 1. Upgrade foreground service type to include MEDIA_PROJECTION FIRST
-                    startAsForegroundService(includeMediaProjection = true)
-                    // 2. THEN call getMediaProjection -> registerCallback -> createVirtualDisplay
-                    startScreenCapture(projCode, projData)
-                } else if (intent.action == ACTION_START_OVERLAY && !hasMediaProjectionGrant) {
-                    // Started without screen capture (user disabled Auto-Read or declined prompt)
-                    stopScreenCapture()
-                    if (!prefs.autoReadScreen) {
-                        setOverlayMode(if (prefs.tapInputMode) OverlayMode.TAP_MOVE else OverlayMode.PASS_THROUGH)
+                    lastCaptureError = null
+                    val fgsOk = startAsForegroundService(includeMediaProjection = true)
+                    if (fgsOk) {
+                        // 2. THEN call getMediaProjection -> registerCallback -> createVirtualDisplay synchronously
+                        startScreenCapture(projCode, projData)
                     } else {
-                        // Declined prompt -> default cleanly into manual Tap mode
-                        prefs.tapInputMode = true
-                        setOverlayMode(OverlayMode.TAP_MOVE)
+                        // FGS upgrade failed; keep service alive as specialUse and surface exact error
+                        startAsForegroundService(includeMediaProjection = false)
+                        stopScreenCapture()
+                        Toast.makeText(
+                            this,
+                            "Auto-Read error: ${(lastCaptureError ?: "FGS failed").take(70)}",
+                            Toast.LENGTH_LONG
+                        ).show()
+                        updateBoardVisibility()
+                        updatePillVisualState()
+                        settingsController?.syncFromPrefs()
                     }
-                    updateBoardVisibility()
-                    updatePillVisualState()
+                    // 3. ONLY AFTER FGS + VirtualDisplay are settled, launch target chess app
+                    if (shouldLaunchTargetApp) {
+                        val pkgToLaunch = activeTargetPackage
+                        mainHandler.postDelayed({ launchTargetChessApp(pkgToLaunch) }, 250L)
+                    }
+                } else if (intent.action == ACTION_START_OVERLAY) {
+                    if (!hasMediaProjectionGrant) {
+                        // Started without screen capture (user disabled Auto-Read or declined prompt)
+                        stopScreenCapture()
+                        lastCaptureError = incomingCaptureError
+                        if (!prefs.autoReadScreen) {
+                            setOverlayMode(if (prefs.tapInputMode) OverlayMode.TAP_MOVE else OverlayMode.PASS_THROUGH)
+                        } else {
+                            // Declined prompt -> default cleanly into manual Tap mode
+                            prefs.tapInputMode = true
+                            setOverlayMode(OverlayMode.TAP_MOVE)
+                        }
+                        updateBoardVisibility()
+                        updatePillVisualState()
+                        settingsController?.syncFromPrefs()
+                    }
+                    if (shouldLaunchTargetApp) {
+                        val pkgToLaunch = activeTargetPackage
+                        mainHandler.postDelayed({ launchTargetChessApp(pkgToLaunch) }, 150L)
+                    }
                 }
             }
         }
-        return START_STICKY
+        // START_NOT_STICKY prevents Android from resurrecting a zombie overlay without screen permission
+        return START_NOT_STICKY
+    }
+
+    private fun launchTargetChessApp(targetPkg: String) {
+        if (targetPkg.isBlank()) return
+        val launchIntent = try {
+            packageManager.getLaunchIntentForPackage(targetPkg)
+        } catch (_: Throwable) {
+            null
+        } ?: return
+        launchIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        try {
+            startActivity(launchIntent)
+        } catch (_: Throwable) {
+        }
     }
 
     @Suppress("DEPRECATION")
@@ -177,7 +227,7 @@ class OverlayService : Service() {
         }
     }
 
-    private fun startAsForegroundService(includeMediaProjection: Boolean) {
+    private fun startAsForegroundService(includeMediaProjection: Boolean): Boolean {
         val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
         val channel = NotificationChannel(
             CHANNEL_ID,
@@ -224,22 +274,35 @@ class OverlayService : Service() {
             .addAction(0, "Stop", stopPending)
             .build()
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-            val fgsType = if (includeMediaProjection) {
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE or
+        return try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                val fgsType = if (includeMediaProjection) {
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE or
+                        ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
+                } else {
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+                }
+                startForeground(NOTIFICATION_ID, notification, fgsType)
+            } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && includeMediaProjection) {
+                startForeground(
+                    NOTIFICATION_ID,
+                    notification,
                     ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
+                )
             } else {
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+                startForeground(NOTIFICATION_ID, notification)
             }
-            startForeground(NOTIFICATION_ID, notification, fgsType)
-        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && includeMediaProjection) {
-            startForeground(
-                NOTIFICATION_ID,
-                notification,
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
-            )
-        } else {
-            startForeground(NOTIFICATION_ID, notification)
+            true
+        } catch (t: Throwable) {
+            if (includeMediaProjection) {
+                val msg = t.message?.trim().orEmpty()
+                lastCaptureError = if (msg.isNotEmpty()) {
+                    "FGS: ${t.javaClass.simpleName}: $msg"
+                } else {
+                    "FGS: ${t.javaClass.simpleName}"
+                }
+            }
+            false
         }
     }
 
@@ -250,18 +313,23 @@ class OverlayService : Service() {
         lastFramesCaptured = 0L
         lastDetectionBestScore = 0f
         lastDetectionNote = ""
+        lastCaptureError = null
 
+        var readerRef: ScreenBoardReader? = null
         val reader = ScreenBoardReader(
             context = this,
             onFrameAnalyzed = { analysis -> handleScreenFrame(analysis) },
             onProjectionStopped = {
                 hasMediaProjectionGrant = false
+                hasActiveScreenCapture = false
                 autoBoardDetectedVisible = false
+                lastCaptureError = readerRef?.lastError ?: "Screen capture stopped by Android"
                 updateBoardVisibility()
                 updatePillVisualState()
                 settingsController?.syncFromPrefs()
             }
         )
+        readerRef = reader
 
         if (manualAlignLocked) {
             boardParams?.let { bp ->
@@ -273,21 +341,27 @@ class OverlayService : Service() {
         if (ok) {
             screenBoardReader = reader
             hasMediaProjectionGrant = true
+            hasActiveScreenCapture = true
+            lastCaptureError = null
             // Start cleanly in Pass-Through mode so user plays right on Chess.com immediately!
             prefs.tapInputMode = false
             setOverlayMode(OverlayMode.PASS_THROUGH)
             // Keep board overlay hidden until an actual 8x8 chess board appears on screen
             updateBoardVisibility()
             updatePillVisualState()
+            settingsController?.syncFromPrefs()
         } else {
             hasMediaProjectionGrant = false
+            hasActiveScreenCapture = false
+            lastCaptureError = reader.lastError ?: "Screen capture failed to start"
             Toast.makeText(
                 this,
-                "Screen capture unavailable — switched to Manual mode",
-                Toast.LENGTH_SHORT
+                "Auto-Read error: ${lastCaptureError!!.take(70)}",
+                Toast.LENGTH_LONG
             ).show()
             updateBoardVisibility()
             updatePillVisualState()
+            settingsController?.syncFromPrefs()
         }
     }
 
@@ -295,6 +369,7 @@ class OverlayService : Service() {
         screenBoardReader?.stop()
         screenBoardReader = null
         hasMediaProjectionGrant = false
+        hasActiveScreenCapture = false
         autoBoardDetectedVisible = false
         lastFramesCaptured = 0L
         lastDetectionBestScore = 0f
@@ -717,22 +792,34 @@ class OverlayService : Service() {
     }
 
     private fun describeScreenReadStatus(): String {
-        return when {
-            isAutoReadLive() && (autoBoardDetectedVisible || manualAlignLocked) -> {
-                val side = if (prefs.playingAsWhite) "White" else "Black"
-                val moveNum = board.fullMoveNumber
-                "Auto-Read: Locked ($side · move $moveNum)"
-            }
-            isAutoReadLive() && lastFramesCaptured == 0L ->
-                "Auto-Read: Waiting for screen frames..."
-            isAutoReadLive() ->
-                "Auto-Read: Scanning (${lastFramesCaptured}f) — open a game"
-            prefs.autoReadScreen && !hasMediaProjectionGrant ->
-                "Auto-Read: Needs screen permission (tap Start in app)"
-            prefs.tapInputMode ->
-                "Manual Tap Mode (tap moves on board)"
-            else ->
-                "Manual Pass-Through Mode"
+        return AutoReadStatusFormatter.formatStatus(
+            autoReadEnabled = prefs.autoReadScreen,
+            autoReadLive = isAutoReadLive(),
+            hasMediaProjectionGrant = hasMediaProjectionGrant,
+            boardVisibleOrLocked = autoBoardDetectedVisible || manualAlignLocked,
+            playingAsWhite = prefs.playingAsWhite,
+            fullMoveNumber = board.fullMoveNumber,
+            framesCaptured = lastFramesCaptured,
+            bestScore = lastDetectionBestScore,
+            lastCaptureError = lastCaptureError,
+            tapInputMode = prefs.tapInputMode
+        )
+    }
+
+    private fun launchGrantScreenPermissionActivity() {
+        hideSettingsModal()
+        Toast.makeText(
+            this,
+            "Opening Screen Capture permission…",
+            Toast.LENGTH_SHORT
+        ).show()
+        val i = Intent(this, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP
+            putExtra(MainActivity.EXTRA_REQUEST_AUTO_READ, true)
+        }
+        try {
+            startActivity(i)
+        } catch (_: Throwable) {
         }
     }
 
@@ -751,6 +838,7 @@ class OverlayService : Service() {
             prefs = prefs,
             engineNameProvider = { engine.activeEngineName },
             screenReadStatusProvider = { describeScreenReadStatus() },
+            needsScreenPermissionProvider = { prefs.autoReadScreen && !hasMediaProjectionGrant },
             onSettingsChanged = { reanalyze ->
                 applyPrefsToViews()
                 if (reanalyze) {
@@ -761,21 +849,9 @@ class OverlayService : Service() {
             },
             onAutoReadToggled = { enabled ->
                 if (enabled && !hasMediaProjectionGrant) {
-                    hideSettingsModal()
-                    Toast.makeText(
-                        this,
-                        "Opening app to grant Screen Capture permission…",
-                        Toast.LENGTH_SHORT
-                    ).show()
-                    val i = Intent(this, MainActivity::class.java).apply {
-                        flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP
-                        putExtra(MainActivity.EXTRA_REQUEST_AUTO_READ, true)
-                    }
-                    try {
-                        startActivity(i)
-                    } catch (_: Throwable) {
-                    }
+                    launchGrantScreenPermissionActivity()
                 } else if (!enabled) {
+                    lastCaptureError = null
                     stopScreenCapture()
                     updateBoardVisibility()
                     updatePillVisualState()
@@ -798,13 +874,17 @@ class OverlayService : Service() {
             },
             onNewGameClicked = { resetGame() },
             onRedetectClicked = {
-                manualAlignLocked = false
-                screenBoardReader?.lockedScreenRect = null
-                trackingSession.resetTracking()
-                autoBoardDetectedVisible = false
-                updateBoardVisibility()
-                updatePillVisualState()
-                Toast.makeText(this, "Scanning for board…", Toast.LENGTH_SHORT).show()
+                if (prefs.autoReadScreen && !hasMediaProjectionGrant) {
+                    launchGrantScreenPermissionActivity()
+                } else {
+                    manualAlignLocked = false
+                    screenBoardReader?.lockedScreenRect = null
+                    trackingSession.resetTracking()
+                    autoBoardDetectedVisible = false
+                    updateBoardVisibility()
+                    updatePillVisualState()
+                    Toast.makeText(this, "Scanning for board…", Toast.LENGTH_SHORT).show()
+                }
             },
             onDismiss = { hideSettingsModal() }
         ).also { settingsController = it }
@@ -948,6 +1028,8 @@ class OverlayService : Service() {
 
     override fun onDestroy() {
         isRunning = false
+        hasActiveScreenCapture = false
+        mainHandler.removeCallbacksAndMessages(null)
         stopScreenCapture()
         analysisJob?.cancel()
         engine.close()
@@ -975,14 +1057,20 @@ class OverlayService : Service() {
         const val ACTION_STOP = "com.chesscoach.overlay.ACTION_STOP"
         const val ACTION_UPDATE_TARGET_APP = "com.chesscoach.overlay.ACTION_UPDATE_TARGET_APP"
         const val EXTRA_TARGET_PACKAGE = "extra_target_package"
+        const val EXTRA_LAUNCH_TARGET_APP = "extra_launch_target_app"
         const val EXTRA_PROJECTION_RESULT_CODE = "extra_projection_result_code"
         const val EXTRA_PROJECTION_DATA = "extra_projection_data"
+        const val EXTRA_CAPTURE_ERROR = "extra_capture_error"
 
         private const val CHANNEL_ID = "chess_coach_overlay_channel"
         private const val NOTIFICATION_ID = 4107
 
         @Volatile
         var isRunning: Boolean = false
+            private set
+
+        @Volatile
+        var hasActiveScreenCapture: Boolean = false
             private set
     }
 }

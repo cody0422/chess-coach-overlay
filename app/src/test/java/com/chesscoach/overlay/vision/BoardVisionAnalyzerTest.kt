@@ -453,4 +453,78 @@ class BoardVisionAnalyzerTest {
         assertEquals(Squares.parse("e2"), risks[0].blockerSquare)
         assertFalse(risks[0].isDirectAttack)
     }
+
+    @Test
+    fun autoReadStatusFormatterCoversErrorTelemetryScanningAndGrantButton() {
+        val longErr = "getMediaProjection: SecurityException: Media projections require a foreground service of type FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION"
+        val errStatus = AutoReadStatusFormatter.formatStatus(
+            autoReadEnabled = true,
+            autoReadLive = false,
+            hasMediaProjectionGrant = false,
+            boardVisibleOrLocked = false,
+            playingAsWhite = true,
+            fullMoveNumber = 1,
+            framesCaptured = 0L,
+            bestScore = 0f,
+            lastCaptureError = longErr,
+            tapInputMode = false
+        )
+        assertTrue(errStatus.startsWith("Auto-Read error: getMediaProjection: SecurityException:"))
+        assertEquals("Auto-Read error: ".length + 90, errStatus.length)
+
+        val scanStatus = AutoReadStatusFormatter.formatStatus(
+            autoReadEnabled = true,
+            autoReadLive = true,
+            hasMediaProjectionGrant = true,
+            boardVisibleOrLocked = false,
+            playingAsWhite = true,
+            fullMoveNumber = 1,
+            framesCaptured = 14L,
+            bestScore = 0.678f,
+            lastCaptureError = null,
+            tapInputMode = false
+        )
+        assertEquals("Auto-Read: Scanning (14f · best 67%) — open a game", scanStatus)
+
+        val lockedStatus = AutoReadStatusFormatter.formatStatus(
+            autoReadEnabled = true,
+            autoReadLive = true,
+            hasMediaProjectionGrant = true,
+            boardVisibleOrLocked = true,
+            playingAsWhite = false,
+            fullMoveNumber = 12,
+            framesCaptured = 20L,
+            bestScore = 0.94f,
+            lastCaptureError = null,
+            tapInputMode = false
+        )
+        assertEquals("Auto-Read: Locked (Black · move 12)", lockedStatus)
+
+        val needsPerm = AutoReadStatusFormatter.formatStatus(
+            autoReadEnabled = true,
+            autoReadLive = false,
+            hasMediaProjectionGrant = false,
+            boardVisibleOrLocked = false,
+            playingAsWhite = true,
+            fullMoveNumber = 1,
+            framesCaptured = 0L,
+            bestScore = 0f,
+            lastCaptureError = null,
+            tapInputMode = true
+        )
+        assertEquals("Auto-Read: Needs screen permission (tap Grant Access)", needsPerm)
+
+        assertEquals(
+            "Grant Access",
+            AutoReadStatusFormatter.actionButtonLabel(autoReadEnabled = true, hasMediaProjectionGrant = false)
+        )
+        assertEquals(
+            "Re-Detect",
+            AutoReadStatusFormatter.actionButtonLabel(autoReadEnabled = true, hasMediaProjectionGrant = true)
+        )
+        assertEquals(
+            "Re-Detect",
+            AutoReadStatusFormatter.actionButtonLabel(autoReadEnabled = false, hasMediaProjectionGrant = false)
+        )
+    }
 }

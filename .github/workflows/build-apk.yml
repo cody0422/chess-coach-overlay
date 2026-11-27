@@ -92,14 +92,14 @@ jobs:
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v2.1.0
-          name: ChessCoachOverlay v2.1.0
+          tag_name: v2.2.0
+          name: ChessCoachOverlay v2.2.0
           body: |
-            ## ChessCoachOverlay v2.1.0
-            - **Android 14/15 Full-Display Capture Fix:** Uses `MediaProjectionConfig.createConfigForDefaultDisplay()` so Samsung One UI 7 / Android 15 captures the entire screen across apps instead of defaulting to single-app capture
-            - **Rock-Solid Board Detection Across All Themes:** Upgraded dense 2-stage board scanner (`stepY = size/90`, inner 15%/85% corner sampling, dual wide+tight seam alignment, anti-shift border validation) — detects Chess.com Classic Green, Dark Slate, Wood, Blue, and arbitrary board offsets while cleanly ignoring menus
-            - **Static-Screen & Offline Bot Support:** `ImageReader.OnImageAvailableListener` + cached-frame re-analysis prevents static screens (games without a ticking clock) from starving move detection, with live frame diagnostics in Settings
-            - **Cutout-Safe Alignment & Instant Arrows:** Display-cutout-aware overlay positioning (`LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES`) plus instant best-move arrow display on board lock and guaranteed manual Align fallback
+            ## ChessCoachOverlay v2.2.0
+            - **Android 14/15 MediaProjection Race Fix:** `OverlayService` now completes FGS upgrade (`specialUse|mediaProjection`), `getMediaProjection()`, `registerCallback()`, and `createVirtualDisplay()` synchronously while `MainActivity` is still foreground before launching Chess.com (fixes screen-capture revocation on Samsung One UI 7 / Android 15)
+            - **No More Zombie Overlays:** Switched `OverlayService` to `START_NOT_STICKY` so Android never resurrects an unpermitted overlay after app updates or background kills
+            - **1-Tap Grant Access in Settings & App:** When screen permission isn't active yet, Settings shows a green **Grant Access** button (and MainActivity shows **Grant Screen Permission & Open Chess.com**) that immediately launches the Android capture prompt and jumps straight back to your game
+            - **Real Error & Scan Telemetry:** Never swallows capture exceptions — Settings displays exact FGS / MediaProjection / VirtualDisplay error details or live scan progress (`Scanning (Xf · best Y%)`)
             - **100% Offline Stockfish 17 ARM64 + Pure-Kotlin Fallback:** Adjustable **400–4000 Elo**, **50%–100% Accuracy**, **Depth 1–8**, **Play Styles (Default · Aggressive · Passive · Human)**, and **∞ Unlimited Moves/Day**
           files: |
             ChessCoachOverlay.apk

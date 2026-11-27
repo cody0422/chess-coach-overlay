@@ -12,12 +12,14 @@ import androidx.appcompat.widget.SwitchCompat
 import com.chesscoach.overlay.R
 import com.chesscoach.overlay.data.OverlayPrefs
 import com.chesscoach.overlay.engine.EloAccuracyHelper
+import com.chesscoach.overlay.vision.AutoReadStatusFormatter
 
 class SettingsModalController(
     themedContext: Context,
     private val prefs: OverlayPrefs,
     private val engineNameProvider: () -> String,
     private val screenReadStatusProvider: () -> String,
+    private val needsScreenPermissionProvider: () -> Boolean,
     private val onSettingsChanged: (reanalyze: Boolean) -> Unit,
     private val onAutoReadToggled: (enabled: Boolean) -> Unit,
     private val onTapInputToggled: (enabled: Boolean) -> Unit,
@@ -94,6 +96,15 @@ class SettingsModalController(
 
     fun updateScreenReadStatus(status: String) {
         tvScreenReadStatus.text = status
+        updateRedetectButtonLabel()
+    }
+
+    private fun updateRedetectButtonLabel() {
+        val hasGrant = !needsScreenPermissionProvider()
+        btnRedetect.text = AutoReadStatusFormatter.actionButtonLabel(
+            autoReadEnabled = prefs.autoReadScreen,
+            hasMediaProjectionGrant = hasGrant
+        )
     }
 
     fun syncFromPrefs() {
@@ -126,6 +137,7 @@ class SettingsModalController(
             swPieceMarkers.isChecked = prefs.showPieceMarkers
 
             tvScreenReadStatus.text = screenReadStatusProvider()
+            updateRedetectButtonLabel()
             updatePlayStyleButton()
             updateSideButtons(prefs.playingAsWhite)
             tvEngineFooter.text = "Engine: ${engineNameProvider()} • ∞ Moves/Day"
@@ -179,6 +191,7 @@ class SettingsModalController(
             prefs.autoReadScreen = checked
             onAutoReadToggled(checked)
             tvScreenReadStatus.text = screenReadStatusProvider()
+            updateRedetectButtonLabel()
         }
         swTapInputMode.setOnCheckedChangeListener { _, checked ->
             if (syncing) return@setOnCheckedChangeListener

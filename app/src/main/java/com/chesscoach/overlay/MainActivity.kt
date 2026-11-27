@@ -87,6 +87,7 @@ class MainActivity : AppCompatActivity() {
         swAutoReadBoardMain.isChecked = prefs.autoReadScreen
         swAutoReadBoardMain.setOnCheckedChangeListener { _, checked ->
             prefs.autoReadScreen = checked
+            updateUi()
         }
 
         cardSelectedApp.setOnClickListener {
@@ -98,7 +99,12 @@ class MainActivity : AppCompatActivity() {
         }
 
         btnToggleOverlay.setOnClickListener {
-            if (OverlayService.isRunning) {
+            val needsScreenPermission = OverlayService.isRunning &&
+                prefs.autoReadScreen &&
+                !OverlayService.hasActiveScreenCapture
+            if (needsScreenPermission) {
+                startOverlayAndLaunchApp()
+            } else if (OverlayService.isRunning) {
                 stopOverlay()
             } else {
                 startOverlayAndLaunchApp()
@@ -122,7 +128,11 @@ class MainActivity : AppCompatActivity() {
             if (Settings.canDrawOverlays(this)) {
                 prefs.autoReadScreen = true
                 swAutoReadBoardMain.isChecked = true
+                // Always request screen capture permission even when OverlayService is already running
                 requestScreenCaptureOrStartManual()
+            } else {
+                Toast.makeText(this, "Grant Overlay Permission first", Toast.LENGTH_SHORT).show()
+                openOverlayPermissionSettings()
             }
         }
     }
@@ -176,7 +186,18 @@ class MainActivity : AppCompatActivity() {
             tvSelectedAppBadge.setTextColor(ContextCompat.getColor(this, R.color.warning_orange))
         }
 
-        if (OverlayService.isRunning) {
+        val needsScreenPermission = OverlayService.isRunning &&
+            prefs.autoReadScreen &&
+            !OverlayService.hasActiveScreenCapture
+        if (needsScreenPermission) {
+            btnToggleOverlay.text = if (installed) {
+                "Grant Screen Permission & Open $selectedName"
+            } else {
+                "Grant Screen Permission"
+            }
+            btnToggleOverlay.setBackgroundResource(R.drawable.bg_button_primary)
+            btnToggleOverlay.setTextColor(Color.parseColor("#071A12"))
+        } else if (OverlayService.isRunning) {
             btnToggleOverlay.text = getString(R.string.stop_overlay)
             btnToggleOverlay.setBackgroundResource(R.drawable.bg_button_secondary)
             btnToggleOverlay.setTextColor(ContextCompat.getColor(this, R.color.text_primary))
@@ -243,55 +264,83 @@ class MainActivity : AppCompatActivity() {
     private fun requestScreenCaptureOrStartManual() {
         val mpm = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as? MediaProjectionManager
         if (mpm == null) {
-            launchOverlayServiceAndChessApp(Activity.RESULT_CANCELED, null)
+            launchOverlayServiceAndChessApp(
+                Activity.RESULT_CANCELED,
+                null,
+                captureError = "MediaProjectionManager unavailable"
+            )
             return
         }
-        try {
-            val captureIntent = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+
+        var lastCreateError: Throwable? = null
+        val captureIntent = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            try {
                 mpm.createScreenCaptureIntent(MediaProjectionConfig.createConfigForDefaultDisplay())
-            } else {
-                mpm.createScreenCaptureIntent()
+            } catch (t: Throwable) {
+                lastCreateError = t
+                try {
+                    mpm.createScreenCaptureIntent()
+                } catch (t2: Throwable) {
+                    lastCreateError = t2
+                    null
+                }
             }
-            screenCaptureLauncher.launch(captureIntent)
-        } catch (_: Throwable) {
+        } else {
+            try {
+                mpm.createScreenCaptureIntent()
+            } catch (t: Throwable) {
+                lastCreateError = t
+                null
+            }
+        }
+
+        if (captureIntent == null) {
+            val err = lastCreateError?.let { "${it.javaClass.simpleName}: ${it.message ?: "unknown"}" }
+                ?: "createScreenCaptureIntent failed"
             Toast.makeText(
                 this,
                 "Screen capture unavailable — starting in Manual Tap mode",
                 Toast.LENGTH_SHORT
             ).show()
-            launchOverlayServiceAndChessApp(Activity.RESULT_CANCELED, null)
+            launchOverlayServiceAndChessApp(Activity.RESULT_CANCELED, null, captureError = err)
+            return
+        }
+
+        try {
+            screenCaptureLauncher.launch(captureIntent)
+        } catch (t: Throwable) {
+            val err = "launchCapture: ${t.javaClass.simpleName}: ${t.message ?: "unknown"}"
+            Toast.makeText(
+                this,
+                "Screen capture unavailable — starting in Manual Tap mode",
+                Toast.LENGTH_SHORT
+            ).show()
+            launchOverlayServiceAndChessApp(Activity.RESULT_CANCELED, null, captureError = err)
         }
     }
 
-    private fun launchOverlayServiceAndChessApp(projectionResultCode: Int, projectionData: Intent?) {
+    private fun launchOverlayServiceAndChessApp(
+        projectionResultCode: Int,
+        projectionData: Intent?,
+        captureError: String? = null
+    ) {
         val targetPkg = prefs.selectedAppPackage
         val serviceIntent = Intent(this, OverlayService::class.java).apply {
             action = OverlayService.ACTION_START_OVERLAY
             putExtra(OverlayService.EXTRA_TARGET_PACKAGE, targetPkg)
+            putExtra(OverlayService.EXTRA_LAUNCH_TARGET_APP, true)
             putExtra(OverlayService.EXTRA_PROJECTION_RESULT_CODE, projectionResultCode)
             if (projectionData != null) {
                 putExtra(OverlayService.EXTRA_PROJECTION_DATA, projectionData)
             }
+            if (!captureError.isNullOrBlank()) {
+                putExtra(OverlayService.EXTRA_CAPTURE_ERROR, captureError)
+            }
         }
+        // Keep MainActivity in the foreground while OverlayService upgrades FGS to MEDIA_PROJECTION
+        // and calls getMediaProjection() + createVirtualDisplay(); OverlayService launches the chess app after!
         ContextCompat.startForegroundService(this, serviceIntent)
-
-        // Automatically launch the chosen chess app if installed
-        if (targetPkg.isNotBlank()) {
-            val launchIntent = try {
-                packageManager.getLaunchIntentForPackage(targetPkg)
-            } catch (_: Throwable) {
-                null
-            }
-            if (launchIntent != null) {
-                launchIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                try {
-                    startActivity(launchIntent)
-                } catch (_: Throwable) {
-                }
-            }
-        }
-
-        btnToggleOverlay.postDelayed({ updateUi() }, 250L)
+        btnToggleOverlay.postDelayed({ updateUi() }, 350L)
     }
 
     private fun stopOverlay() {
