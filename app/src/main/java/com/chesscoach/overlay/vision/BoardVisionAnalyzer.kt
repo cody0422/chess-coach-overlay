@@ -705,7 +705,7 @@ object BoardVisionAnalyzer {
             detection.oddRgb.r, detection.oddRgb.g, detection.oddRgb.b
         )
         // Gently lower foreground distance threshold on low-contrast dark/slate themes
-        val fgDistThreshold = (boardSep * 0.65f).coerceIn(22f, 30f)
+        val fgDistThreshold = (boardSep * 0.60f).coerceIn(18f, 30f)
 
         for (r in 0..7) {
             for (c in 0..7) {
@@ -721,7 +721,7 @@ object BoardVisionAnalyzer {
                     localBg[0], localBg[1], localBg[2],
                     parityBg.r, parityBg.g, parityBg.b
                 )
-                val useLocalBg = pairDist <= 20f && localDistFromParity in 14f..145f
+                val useLocalBg = pairDist <= 20f && localDistFromParity in 14f..280f
                 val bgR = if (useLocalBg) localBg[0] else parityBg.r
                 val bgG = if (useLocalBg) localBg[1] else parityBg.g
                 val bgB = if (useLocalBg) localBg[2] else parityBg.b
