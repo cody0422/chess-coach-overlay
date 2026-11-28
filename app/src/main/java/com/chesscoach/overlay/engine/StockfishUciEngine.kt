@@ -261,8 +261,10 @@ class StockfishUciEngine(private val context: Context) {
 
     private val fallbackEngine = ChessEngine()
     private val ioLock = Any()
+    private val writerLock = Any()
     private val searching = AtomicBoolean(false)
     private val cancelRequested = AtomicBoolean(false)
+    private var needsReadySync: Boolean = false
 
     @Volatile
     private var process: Process? = null
@@ -307,6 +309,7 @@ class StockfishUciEngine(private val context: Context) {
         lastLimitStrength = null
         lastUciElo = -1
         lastSkillLevel = -1
+        needsReadySync = false
     }
 
     private fun startStockfishLocked(): Boolean {
@@ -373,13 +376,15 @@ class StockfishUciEngine(private val context: Context) {
         cancelRequested.set(true)
         fallbackEngine.cancel()
         if (searching.get()) {
-            try {
-                writer?.let {
-                    it.write("stop\n")
-                    it.flush()
+            synchronized(writerLock) {
+                try {
+                    writer?.let {
+                        it.write("stop\n")
+                        it.flush()
+                    }
+                } catch (_: Throwable) {
+                    // Ignore cancellation write failure
                 }
-            } catch (_: Throwable) {
-                // Ignore cancellation write failure
             }
         }
     }
@@ -512,11 +517,12 @@ class StockfishUciEngine(private val context: Context) {
                     }
                 }
 
-                if (optionsChanged) {
+                if (optionsChanged || needsReadySync) {
                     sendLineLocked("isready")
                     if (!waitForTokenLocked("readyok", 3000L)) {
                         throw IllegalStateException("Stockfish not ready")
                     }
+                    needsReadySync = false
                 }
 
                 val fen = sourceBoard.toFen()
@@ -592,6 +598,9 @@ class StockfishUciEngine(private val context: Context) {
                 }
 
                 searching.set(false)
+                if (bestMoveUci == null) {
+                    needsReadySync = true
+                }
 
                 StockfishUciParser.buildAnalysisResult(
                     sourceBoard = sourceBoard,
@@ -617,10 +626,12 @@ class StockfishUciEngine(private val context: Context) {
     }
 
     private fun sendLineLocked(cmd: String) {
-        val w = writer ?: throw IllegalStateException("Stockfish writer closed")
-        w.write(cmd)
-        w.write("\n")
-        w.flush()
+        synchronized(writerLock) {
+            val w = writer ?: throw IllegalStateException("Stockfish writer closed")
+            w.write(cmd)
+            w.write("\n")
+            w.flush()
+        }
     }
 
     private fun waitForTokenLocked(token: String, timeoutMs: Long): Boolean {

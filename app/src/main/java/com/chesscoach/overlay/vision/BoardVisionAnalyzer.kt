@@ -710,9 +710,15 @@ object BoardVisionAnalyzer {
         val headLen: Float,
         val shaftRadius: Float,
         val headHalfW: Float,
-        val headPad: Float
+        val outlinePad: Float
     ) {
-        fun contains(px: Float, py: Float): Boolean {
+        /**
+         * Returns:
+         * - 0: outside the drawn arrow
+         * - 1: inside the slim black arrow core fill
+         * - 2: inside the narrow outer outline/anti-alias halo band
+         */
+        fun classifyPoint(px: Float, py: Float): Int {
             // Distance to arrow shaft segment (tail -> base)
             val dx = baseX - tailX
             val dy = baseY - tailY
@@ -725,18 +731,21 @@ object BoardVisionAnalyzer {
                 val cy = tailY + t * dy
                 sqrt((px - cx) * (px - cx) + (py - cy) * (py - cy))
             }
-            if (segDist <= shaftRadius) return true
+            if (segDist <= shaftRadius) return 1
+
+            var inOutline = segDist <= shaftRadius + outlinePad
 
             // Arrowhead triangle in local (u along arrow from base to tip, v perpendicular)
             val rx = px - baseX
             val ry = py - baseY
             val u = rx * cosA + ry * sinA
-            if (u >= -headPad && u <= headLen + headPad) {
+            if (u >= -outlinePad && u <= headLen + outlinePad) {
                 val v = abs(-rx * sinA + ry * cosA)
                 val frac = ((headLen - u) / max(1f, headLen)).coerceIn(0f, 1f)
-                if (v <= frac * headHalfW + headPad) return true
+                if (u in 0f..headLen && v <= frac * headHalfW) return 1
+                if (v <= frac * headHalfW + outlinePad) inOutline = true
             }
-            return false
+            return if (inOutline) 2 else 0
         }
     }
 
@@ -778,9 +787,9 @@ object BoardVisionAnalyzer {
             cosA = cosA,
             sinA = sinA,
             headLen = headLen,
-            shaftRadius = minSq * 0.12f,
-            headHalfW = minSq * 0.20f,
-            headPad = minSq * 0.04f
+            shaftRadius = minSq * 0.085f,
+            headHalfW = minSq * 0.19f,
+            outlinePad = minSq * 0.048f
         )
     }
 
@@ -831,7 +840,7 @@ object BoardVisionAnalyzer {
                     localBg[0], localBg[1], localBg[2],
                     parityBg.r, parityBg.g, parityBg.b
                 )
-                val useLocalBg = pairDist <= 20f && localDistFromParity in 14f..280f
+                val useLocalBg = pairDist <= 28f && localDistFromParity in 12f..280f
                 val bgR = if (useLocalBg) localBg[0] else parityBg.r
                 val bgG = if (useLocalBg) localBg[1] else parityBg.g
                 val bgB = if (useLocalBg) localBg[2] else parityBg.b
@@ -862,14 +871,27 @@ object BoardVisionAnalyzer {
                     for (sx in 0 until samples) {
                         val px = (startX + (sx + 0.5f) * spanX / samples)
                             .roundToInt().coerceIn(0, width - 1)
-                        if (arrowMask != null && arrowMask.contains(px.toFloat(), py.toFloat())) {
-                            prevPx = -1
-                            continue
-                        }
                         val argb = pixels[rowOff + px]
                         val pr = (argb ushr 16) and 0xFF
                         val pg = (argb ushr 8) and 0xFF
                         val pb = argb and 0xFF
+
+                        if (arrowMask != null) {
+                            val arrowZone = arrowMask.classifyPoint(px.toFloat(), py.toFloat())
+                            if (arrowZone != 0) {
+                                val aLum = (299 * pr + 587 * pg + 114 * pb) / 1000
+                                val aChroma = max(pr, max(pg, pb)) - min(pr, min(pg, pb))
+                                // Skip ONLY pixels matching our dark charcoal arrow fill (#0B0F14 @ 90% alpha)
+                                // or its thin light halo in the narrow outline band — NEVER erase a player's
+                                // moved White/colored piece sitting under the arrowhead!
+                                val isBlackArrowFill = aLum <= 58 && aChroma <= 24
+                                val isWhiteArrowHalo = arrowZone == 2 && aLum >= 165 && aChroma <= 36
+                                if (isBlackArrowFill || isWhiteArrowHalo) {
+                                    prevPx = -1
+                                    continue
+                                }
+                            }
+                        }
 
                         if (isOverlayAnnotationPixel(pr, pg, pb, bgR, bgG, bgB)) {
                             prevPx = -1
@@ -1044,8 +1066,9 @@ object BoardVisionAnalyzer {
     }
 
     /**
-     * Matches an observed 64-square color-occupancy grid against all legal 1-ply moves
-     * (and 2-ply fallback if both players moved quickly between frames).
+     * Matches an observed 64-square color-occupancy grid against all legal 1-ply moves,
+     * 2-ply fallback (both players moved between frames), and fast changed-square-pruned
+     * 3-ply catch-up for rapid bullet sequences.
      */
     fun matchLegalMove(
         currentBoard: ChessBoard,
@@ -1055,7 +1078,7 @@ object BoardVisionAnalyzer {
         if (observedScreenGrid.size != 64) return null
 
         val currentScore = countBoardMatches(currentBoard, observedScreenGrid, playingAsWhite)
-        if (currentScore >= 63) return null
+        if (currentScore == 64) return null
 
         val sim = currentBoard.copy()
         val legal1 = sim.generateLegalMoves()
@@ -1063,20 +1086,41 @@ object BoardVisionAnalyzer {
 
         var best1Move: Move? = null
         var best1Score = -1
+        var secondBest1Score = -1
 
         for (m in legal1) {
             val undo = sim.makeMove(m)
             val s = countBoardMatches(sim, observedScreenGrid, playingAsWhite)
             sim.unmakeMove(m, undo)
-            if (s > best1Score || (s == best1Score && preferPromotionQueen(m, best1Move))) {
+            val isSameFromToPromo = best1Move != null &&
+                m.from == best1Move.from &&
+                m.to == best1Move.to &&
+                m.promotion != Piece.EMPTY &&
+                best1Move.promotion != Piece.EMPTY
+            if (s > best1Score) {
+                secondBest1Score = best1Score
                 best1Score = s
                 best1Move = m
+            } else if (s == best1Score && preferPromotionQueen(m, best1Move)) {
+                if (!isSameFromToPromo) {
+                    secondBest1Score = s
+                }
+                best1Move = m
+            } else if (!isSameFromToPromo && s > secondBest1Score) {
+                secondBest1Score = s
             }
         }
 
-        // If 1-ply move is an exact or near-exact match (63-64/64), return immediately
-        if (best1Move != null && best1Score >= 63 && best1Score >= currentScore + 2) {
-            return LegalMoveMatch(listOf(best1Move), best1Score, currentScore)
+        // Fast-path 1-ply match:
+        // - Exact 64/64 unique match (even when currentScore == 63, e.g. single-square transition/capture)
+        // - Strong 63-64/64 match gaining >= 2 squares
+        if (best1Move != null) {
+            if (best1Score == 64 && currentScore <= 63 && best1Score > secondBest1Score) {
+                return LegalMoveMatch(listOf(best1Move), best1Score, currentScore)
+            }
+            if (best1Score >= 63 && best1Score >= currentScore + 2) {
+                return LegalMoveMatch(listOf(best1Move), best1Score, currentScore)
+            }
         }
 
         // 2-ply lookahead (in case both players moved between two capture frames)
@@ -1111,11 +1155,99 @@ object BoardVisionAnalyzer {
             return LegalMoveMatch(listOf(best2M1, best2M2), best2Score, currentScore)
         }
 
-        if (best1Move != null && best1Score >= 61 && best1Score >= currentScore + 2) {
-            return LegalMoveMatch(listOf(best1Move), best1Score, currentScore)
+        // Accept solid 1-ply match (either >=62 gaining >=2, or unique >=61 gaining >=1)
+        if (best1Move != null) {
+            if (best1Score >= 62 && best1Score >= currentScore + 2) {
+                return LegalMoveMatch(listOf(best1Move), best1Score, currentScore)
+            }
+            if (best1Score >= 61 && best1Score >= currentScore + 1 && best1Score >= secondBest1Score + 1) {
+                return LegalMoveMatch(listOf(best1Move), best1Score, currentScore)
+            }
+        }
+
+        // Fast changed-square-pruned 3-ply catch-up (bullet mode safety net when 3 half-moves
+        // occurred between reads). Only expands moves touching changed squares or prior move targets.
+        if (currentScore <= 61) {
+            val changedMask = collectChangedBoardSquares(currentBoard, observedScreenGrid, playingAsWhite)
+            if (changedMask != 0L) {
+                var best3M1: Move? = null
+                var best3M2: Move? = null
+                var best3M3: Move? = null
+                var best3Score = -1
+
+                for (m1 in legal1) {
+                    if (m1.promotion != Piece.EMPTY && m1.promotion != Piece.QUEEN) continue
+                    if (!touchesMask(m1, changedMask)) continue
+                    val undo1 = sim.makeMove(m1)
+                    val maskAfter1 = changedMask or (1L shl m1.to) or (1L shl m1.from)
+                    val legal2 = sim.generateLegalMoves()
+                    for (m2 in legal2) {
+                        if (m2.promotion != Piece.EMPTY && m2.promotion != Piece.QUEEN) continue
+                        if (!touchesMask(m2, maskAfter1)) continue
+                        val undo2 = sim.makeMove(m2)
+                        val maskAfter2 = maskAfter1 or (1L shl m2.to) or (1L shl m2.from)
+                        val legal3 = sim.generateLegalMoves()
+                        for (m3 in legal3) {
+                            if (m3.promotion != Piece.EMPTY && m3.promotion != Piece.QUEEN) continue
+                            if (!touchesMask(m3, maskAfter2)) continue
+                            val undo3 = sim.makeMove(m3)
+                            val s3 = countBoardMatches(sim, observedScreenGrid, playingAsWhite)
+                            sim.unmakeMove(m3, undo3)
+                            if (s3 > best3Score) {
+                                best3Score = s3
+                                best3M1 = m1
+                                best3M2 = m2
+                                best3M3 = m3
+                            }
+                        }
+                        sim.unmakeMove(m2, undo2)
+                    }
+                    sim.unmakeMove(m1, undo1)
+                }
+
+                if (best3M1 != null && best3M2 != null && best3M3 != null &&
+                    best3Score >= 62 &&
+                    best3Score >= currentScore + 3 &&
+                    best3Score > best2Score &&
+                    best3Score > best1Score
+                ) {
+                    return LegalMoveMatch(listOf(best3M1, best3M2, best3M3), best3Score, currentScore)
+                }
+            }
         }
 
         return null
+    }
+
+    private fun touchesMask(move: Move, squareBitmask: Long): Boolean {
+        val m = (1L shl move.from) or (1L shl move.to)
+        return (squareBitmask and m) != 0L
+    }
+
+    private fun collectChangedBoardSquares(
+        board: ChessBoard,
+        observedScreenGrid: Array<SquareOccupancy>,
+        playingAsWhite: Boolean
+    ): Long {
+        var mask = 0L
+        for (r in 0..7) {
+            val rank = if (playingAsWhite) (7 - r) else r
+            val rowOff = r * 8
+            for (c in 0..7) {
+                val file = if (playingAsWhite) c else (7 - c)
+                val sqIdx = rank * 8 + file
+                val p = board.squares[sqIdx]
+                val expected = when {
+                    p > 0 -> SquareOccupancy.WHITE
+                    p < 0 -> SquareOccupancy.BLACK
+                    else -> SquareOccupancy.EMPTY
+                }
+                if (expected != observedScreenGrid[rowOff + c]) {
+                    mask = mask or (1L shl sqIdx)
+                }
+            }
+        }
+        return mask
     }
 
     private fun preferPromotionQueen(candidate: Move, existing: Move?): Boolean {

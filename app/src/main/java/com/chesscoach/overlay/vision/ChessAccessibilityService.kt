@@ -289,7 +289,7 @@ class ChessAccessibilityService : AccessibilityService() {
     companion object {
         private const val TAG = "ChessA11y"
         private const val TARGET_CAPTURE_WIDTH = 540
-        private const val CAPTURE_WATCHDOG_MS = 3000L
+        private const val CAPTURE_WATCHDOG_MS = 2500L
 
         @Volatile
         var instance: ChessAccessibilityService? = null
@@ -610,10 +610,10 @@ class AccessibilityBoardReader(
 
     companion object {
         private const val INITIAL_CAPTURE_DELAY_MS = 120L
-        private const val EVENT_SETTLE_DELAY_MS = 75L
+        private const val EVENT_SETTLE_DELAY_MS = 160L
         private const val MIN_CAPTURE_INTERVAL_MS = 1020L
         private const val HEARTBEAT_INTERVAL_MS = 1100L
-        private const val HEARTBEAT_LOCKED_INTERVAL_MS = 2200L
+        private const val HEARTBEAT_LOCKED_INTERVAL_MS = 1100L
         private const val RATE_LIMIT_BACKOFF_MS = 650L
     }
 }

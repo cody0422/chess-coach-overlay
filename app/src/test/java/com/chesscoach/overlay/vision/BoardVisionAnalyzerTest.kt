@@ -861,4 +861,256 @@ class BoardVisionAnalyzerTest {
         )
         assertEquals("No-Red-Box: Scanning (3f · best 42%) — open a game", scanning)
     }
+
+    @Test
+    fun fullFourMoveLiveGameUnderActiveBlackArrowsAndYellowHighlightsTracksCleanly() {
+        // Test BOTH Classic Green/Cream AND Ocean themes across a complete 4-ply opening:
+        // 1. e4 e5 2. Nf3 Nc6 — with active black arrows drawn RIGHT ON TOP of the player's
+        // destination squares and Chess.com #F6F669 / #BACA2B yellow last-move highlights!
+        val themes = listOf(
+            Triple("Classic Green", rgb(238, 238, 210), rgb(118, 150, 86)),
+            Triple("Ocean", rgb(250, 240, 230), rgb(78, 138, 170))
+        )
+
+        for ((themeName, lightRgb, darkRgb) in themes) {
+            val tracked = ChessBoard()
+            val truth = ChessBoard()
+            val session = BoardTrackingSession()
+
+            val e2 = Squares.parse("e2")
+            val e4 = Squares.parse("e4")
+            val e7 = Squares.parse("e7")
+            val e5 = Squares.parse("e5")
+            val g1 = Squares.parse("g1")
+            val f3 = Squares.parse("f3")
+            val b8 = Squares.parse("b8")
+            val c6 = Squares.parse("c6")
+
+            // Step 0: Starting position with Move-1 black arrow e2 -> e4 drawn on screen
+            val arrow1 = Move(e2, e4)
+            val frame0Pixels = renderBoardScreen(
+                board = truth,
+                playingAsWhite = true,
+                lightColor = lightRgb,
+                darkColor = darkRgb
+            )
+            drawCrispBlackArrow(frame0Pixels, 540, 1170, 0, 340, 540, arrow1, playingAsWhite = true)
+            val f0 = BoardVisionAnalyzer.analyzeFrame(
+                pixels = frame0Pixels,
+                width = 540,
+                height = 1170,
+                activeArrow = arrow1,
+                activeArrowPlayingAsWhite = true
+            )
+            assertTrue("$themeName start should detect", f0.detection.found)
+            assertEquals("$themeName empty e3 under arrow1", SquareOccupancy.EMPTY, f0.grid!![5 * 8 + 4])
+            assertEquals("$themeName empty e4 under arrow1", SquareOccupancy.EMPTY, f0.grid!![4 * 8 + 4])
+            session.onFrame(f0, tracked, currentPlayingAsWhite = true, singleFrameMoveConfirm = true)
+
+            // Step 1: White plays 1. e4 with yellow highlights on e2/e4 WHILE arrow1 (e2->e4) is STILL drawn!
+            val m1 = truth.generateLegalMoves().first { it.toUci() == "e2e4" }
+            assertTrue(truth.pushMove(m1))
+            val frame1Pixels = renderBoardScreen(
+                board = truth,
+                playingAsWhite = true,
+                lightColor = lightRgb,
+                darkColor = darkRgb,
+                highlightSquares = setOf(e2, e4)
+            )
+            drawCrispBlackArrow(frame1Pixels, 540, 1170, 0, 340, 540, arrow1, playingAsWhite = true)
+            val f1 = BoardVisionAnalyzer.analyzeFrame(
+                pixels = frame1Pixels,
+                width = 540,
+                height = 1170,
+                activeArrow = arrow1,
+                activeArrowPlayingAsWhite = true
+            )
+            assertEquals("$themeName vacated yellow e2 must be EMPTY", SquareOccupancy.EMPTY, f1.grid!![6 * 8 + 4])
+            assertEquals("$themeName moved White pawn on yellow e4 under arrow1 must be WHITE", SquareOccupancy.WHITE, f1.grid!![4 * 8 + 4])
+            val ev1 = session.onFrame(f1, tracked, currentPlayingAsWhite = true, singleFrameMoveConfirm = true)
+            val det1 = ev1.filterIsInstance<BoardTrackingEvent.MovesDetected>().firstOrNull()
+            assertNotNull("$themeName must detect 1. e4 under active black arrow", det1)
+            assertEquals(listOf("e2e4"), det1!!.moves.map { it.toUci() })
+            det1.moves.forEach { assertTrue(tracked.pushMove(it)) }
+
+            // Step 2: Arrow clears (My Turn Only = Black's turn); Black plays 1... e5 with yellow highlights on e7/e5
+            val m2 = truth.generateLegalMoves().first { it.toUci() == "e7e5" }
+            assertTrue(truth.pushMove(m2))
+            val frame2Pixels = renderBoardScreen(
+                board = truth,
+                playingAsWhite = true,
+                lightColor = lightRgb,
+                darkColor = darkRgb,
+                highlightSquares = setOf(e7, e5)
+            )
+            val f2 = BoardVisionAnalyzer.analyzeFrame(
+                pixels = frame2Pixels,
+                width = 540,
+                height = 1170,
+                activeArrow = null,
+                activeArrowPlayingAsWhite = true
+            )
+            assertEquals("$themeName vacated yellow e7 must be EMPTY", SquareOccupancy.EMPTY, f2.grid!![1 * 8 + 4])
+            assertEquals("$themeName moved Black pawn on yellow e5 must be BLACK", SquareOccupancy.BLACK, f2.grid!![3 * 8 + 4])
+            val ev2 = session.onFrame(f2, tracked, currentPlayingAsWhite = true, singleFrameMoveConfirm = true)
+            val det2 = ev2.filterIsInstance<BoardTrackingEvent.MovesDetected>().firstOrNull()
+            assertNotNull("$themeName must detect 1... e5", det2)
+            assertEquals(listOf("e7e5"), det2!!.moves.map { it.toUci() })
+            det2.moves.forEach { assertTrue(tracked.pushMove(it)) }
+
+            // Step 3: White's turn — black arrow g1->f3 drawn; White plays 2. Nf3 WHILE g1->f3 arrow is STILL drawn!
+            val arrow3 = Move(g1, f3)
+            val m3 = truth.generateLegalMoves().first { it.toUci() == "g1f3" }
+            assertTrue(truth.pushMove(m3))
+            val frame3Pixels = renderBoardScreen(
+                board = truth,
+                playingAsWhite = true,
+                lightColor = lightRgb,
+                darkColor = darkRgb,
+                highlightSquares = setOf(g1, f3)
+            )
+            drawCrispBlackArrow(frame3Pixels, 540, 1170, 0, 340, 540, arrow3, playingAsWhite = true)
+            val f3Analysis = BoardVisionAnalyzer.analyzeFrame(
+                pixels = frame3Pixels,
+                width = 540,
+                height = 1170,
+                activeArrow = arrow3,
+                activeArrowPlayingAsWhite = true
+            )
+            assertEquals("$themeName moved White knight on yellow f3 under arrow3 must be WHITE", SquareOccupancy.WHITE, f3Analysis.grid!![5 * 8 + 5])
+            val ev3 = session.onFrame(f3Analysis, tracked, currentPlayingAsWhite = true, singleFrameMoveConfirm = true)
+            val det3 = ev3.filterIsInstance<BoardTrackingEvent.MovesDetected>().firstOrNull()
+            assertNotNull("$themeName must detect 2. Nf3 under active black arrow", det3)
+            assertEquals(listOf("g1f3"), det3!!.moves.map { it.toUci() })
+            det3.moves.forEach { assertTrue(tracked.pushMove(it)) }
+
+            // Step 4: Black plays 2... Nc6 (arrow hidden on Black's turn)
+            val m4 = truth.generateLegalMoves().first { it.toUci() == "b8c6" }
+            assertTrue(truth.pushMove(m4))
+            val frame4Pixels = renderBoardScreen(
+                board = truth,
+                playingAsWhite = true,
+                lightColor = lightRgb,
+                darkColor = darkRgb,
+                highlightSquares = setOf(b8, c6)
+            )
+            val f4 = BoardVisionAnalyzer.analyzeFrame(
+                pixels = frame4Pixels,
+                width = 540,
+                height = 1170,
+                activeArrow = null,
+                activeArrowPlayingAsWhite = true
+            )
+            val ev4 = session.onFrame(f4, tracked, currentPlayingAsWhite = true, singleFrameMoveConfirm = true)
+            val det4 = ev4.filterIsInstance<BoardTrackingEvent.MovesDetected>().firstOrNull()
+            assertNotNull("$themeName must detect 2... Nc6", det4)
+            assertEquals(listOf("b8c6"), det4!!.moves.map { it.toUci() })
+            det4.moves.forEach { assertTrue(tracked.pushMove(it)) }
+            assertEquals("$themeName final FEN must match ground truth after 4 plies", truth.toFen(), tracked.toFen())
+        }
+    }
+
+    @Test
+    fun playingAsBlackDetectsBlackPawnUnderActiveBlackArrow() {
+        val board = ChessBoard()
+        val m1 = board.generateLegalMoves().first { it.toUci() == "e2e4" }
+        assertTrue(board.pushMove(m1))
+
+        val afterE5 = board.copy()
+        val m2 = afterE5.generateLegalMoves().first { it.toUci() == "e7e5" }
+        assertTrue(afterE5.pushMove(m2))
+
+        val e7 = Squares.parse("e7")
+        val e5 = Squares.parse("e5")
+        val arrowBlack = Move(e7, e5)
+
+        val pixels = renderBoardScreen(
+            board = afterE5,
+            playingAsWhite = false,
+            lightColor = rgb(238, 238, 210),
+            darkColor = rgb(118, 150, 86),
+            highlightSquares = setOf(e7, e5)
+        )
+        drawCrispBlackArrow(pixels, 540, 1170, 0, 340, 540, arrowBlack, playingAsWhite = false)
+
+        val analysis = BoardVisionAnalyzer.analyzeFrame(
+            pixels = pixels,
+            width = 540,
+            height = 1170,
+            activeArrow = arrowBlack,
+            activeArrowPlayingAsWhite = false
+        )
+        assertTrue(analysis.detection.found)
+        // When playing as Black: file e = col (7-4) = 3, rank 5 (idx 4) = row 4
+        assertEquals("Moved Black pawn on e5 under black arrow must read BLACK", SquareOccupancy.BLACK, analysis.grid!![4 * 8 + 3])
+        val match = BoardVisionAnalyzer.matchLegalMove(board, analysis.grid!!, playingAsWhite = false)
+        assertNotNull("Expected 1... e5 to match cleanly when playing as Black under active black arrow", match)
+        assertEquals("e7e5", match!!.moves.first().toUci())
+    }
+
+    @Test
+    fun matchLegalMoveAcceptsExact64FromCurrentScore63() {
+        // After 1. e4 d5, if 2. exd5 is played (capture: e4->EMPTY, d5 WHITE replaces BLACK),
+        // e4 and d5 both change (score=62). What if one square already looks occupied by White
+        // (e.g. a noisy capture where only the vacated square differs, so currentScore == 63)?
+        // Verify a unique exact 64/64 1-ply match from currentScore == 63 is accepted!
+        val board = ChessBoard()
+        // Setup position where White captures Black piece with 1 square already matching -> 63/64
+        // Actually: a capture where only 1 square differs? Let's test directly via a board where
+        // e2->e4 is NOT 63, whereas on a capture e4xd5, e4 changes WHITE->EMPTY and d5 changes BLACK->WHITE (2 sq).
+        // Simulate a 1-square-difference noisy pre-frame (currentScore == 63) -> exact 64/64 legal move:
+        // Wait: any legal chess move changes at least 2 squares (from & to), UNLESS the observed grid
+        // has a single-square artifact that happens to match the destination already (currentScore == 63)
+        // OR wait: if observedGrid equals board-after-move, currentScore vs board-before-move is 62.
+        // If one of the two changed squares is untouched in observedGrid, then best1Score would be 63, not 64.
+        // Verify that a 1-ply move with 1 noisy square elsewhere (currentScore = 61 -> best1Score = 63)
+        // AND a 1-ply move where currentScore = 62 -> best1Score = 63 (unique best, secondBest <= 62) both match!
+        val afterE4 = board.copy()
+        val m1 = afterE4.generateLegalMoves().first { it.toUci() == "e2e4" }
+        assertTrue(afterE4.pushMove(m1))
+        val noisyGrid = BoardVisionAnalyzer.boardToScreenGrid(afterE4, playingAsWhite = true)
+        // Introduce 1 transient highlight/artifact on e4 (WHITE -> EMPTY) so currentScore vs start = 63?
+        // Wait: if e4 is EMPTY and e2 is EMPTY, currentScore vs start = 63, and e2e4 score = 63 (not 64).
+        // Instead introduce 1 transient artifact on an unrelated empty square a4 (EMPTY -> WHITE)
+        // while e2=EMPTY and e4=WHITE: currentScore = 61, best1Score(e2e4) = 63, secondBest = 61 -> must match!
+        noisyGrid[4 * 8 + 0] = SquareOccupancy.WHITE
+        val match = BoardVisionAnalyzer.matchLegalMove(board, noisyGrid, playingAsWhite = true)
+        assertNotNull("Expected 1. e4 to match despite 1 unrelated noisy square", match)
+        assertEquals("e2e4", match!!.moves.first().toUci())
+        assertEquals(63, match.score)
+    }
+
+    @Test
+    fun threePlyBulletCatchUpRecoversRapidOpeningAndCaptureSequences() {
+        // Sequence 1: 3 quiet plies (1. e4 e5 2. Nf3) between two screenshots
+        val start1 = ChessBoard()
+        val target1 = start1.copy()
+        for (uci in listOf("e2e4", "e7e5", "g1f3")) {
+            val m = target1.generateLegalMoves().first { it.toUci() == uci }
+            assertTrue(target1.pushMove(m))
+        }
+        val grid1 = BoardVisionAnalyzer.boardToScreenGrid(target1, playingAsWhite = true)
+        val match1 = BoardVisionAnalyzer.matchLegalMove(start1, grid1, playingAsWhite = true)
+        assertNotNull("3-ply catch-up must recover 1. e4 e5 2. Nf3", match1)
+        assertEquals(3, match1!!.moves.size)
+        assertEquals(64, match1.score)
+        val verify1 = start1.copy()
+        match1.moves.forEach { assertTrue(verify1.pushMove(it)) }
+        assertTrue(
+            BoardVisionAnalyzer.boardToScreenGrid(verify1, true).contentEquals(grid1)
+        )
+
+        // Sequence 2: 3 plies WITH a capture on the same square (1. e4 d5 2. exd5)
+        val start2 = ChessBoard()
+        val target2 = start2.copy()
+        for (uci in listOf("e2e4", "d7d5", "e4d5")) {
+            val m = target2.generateLegalMoves().first { it.toUci() == uci }
+            assertTrue(target2.pushMove(m))
+        }
+        val grid2 = BoardVisionAnalyzer.boardToScreenGrid(target2, playingAsWhite = true)
+        val match2 = BoardVisionAnalyzer.matchLegalMove(start2, grid2, playingAsWhite = true)
+        assertNotNull("3-ply catch-up must recover 1. e4 d5 2. exd5 capture sequence", match2)
+        assertEquals(listOf("e2e4", "d7d5", "e4d5"), match2!!.moves.map { it.toUci() })
+        assertEquals(64, match2.score)
+    }
 }

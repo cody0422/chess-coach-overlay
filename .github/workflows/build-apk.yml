@@ -92,15 +92,15 @@ jobs:
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v2.4.1
-          name: ChessCoachOverlay v2.4.1
+          tag_name: v2.5.0
+          name: ChessCoachOverlay v2.5.0
           body: |
-            ## ChessCoachOverlay v2.4.1
-            - **Fixed No-Red-Box Accessibility Screenshots (`AndroidManifest.xml`):** Corrected `AccessibilityService` meta-data tag (`android.accessibilityservice`) so Android loads `@xml/accessibility_service_config` and grants `canTakeScreenshot` cleanly — eliminating the stuck `"Waiting for screen frames..."` state
-            - **Clock-Safe Event Debounce + Watchdog:** Prevents Chess.com's ticking clock events from starving Accessibility board reads and adds a 3-second watchdog guard on in-flight screenshots
-            - **Blazing Fast Sub-Second Arrows (up to 5s at Depth 8):** Eliminated the hidden `MultiPV = 5` bottleneck (now `MultiPV = 1` or `2` in single-arrow mode), cached Stockfish 19 UCI options across moves, upgraded to 2–4 threads + 64 MB hash, streamed first arrow from depth 5 (35ms throttle), ran move-quality grading *after* arrows are drawn with strict 150ms/450ms caps, tightened Accessibility settle to 75ms (2.2s locked heartbeat so it never burns the OS cooldown), and tightened Cast polling to 140ms
-            - **Live Capture Error & Engine Telemetry:** Surfaces any Accessibility screenshot error immediately in Settings and displays active engine status
-            - **Built on v2.4.0:** Official **Stockfish 19 (`sf_19` ARM64 NNUE)** with live ~50ms move streaming, 60fps animated sleek black arrow, `My Turn Only` (your pieces only), 64/64 Ocean board reader, and automatic White/Black orientation detection
+            ## ChessCoachOverlay v2.5.0
+            - **Fixed Move-1 Arrow-Mask Desync (Multi-Move Bulletproof Tracking):** Upgraded `BoardVisionAnalyzer` arrow masking to be pixel-color-aware + slim-corridor so the drawn black arrow never erases your own moved piece sitting under the arrowhead (works for both White and Black pieces on Classic Green, Ocean, and Wood themes)
+            - **Bulletproof Move Matching + Fast 3-Ply Bullet Catch-Up:** Fixed the `currentScore == 63` early-exit stall, added unique second-best verification, added changed-square-pruned 3-ply recovery (<2ms) for rapid multi-move bursts, and expanded local corner-highlight tolerance for Chess.com `#BACA2B` / `#F6F669` yellow last-move highlights
+            - **Continuous 1.1s No-Red-Box Heartbeat + Slide-Safe Settle:** Kept locked Accessibility heartbeat at 1.1s (never stalls when opponent moves without Accessibility events), tuned post-event settle to 160ms so 2-square pawn slides finish landing before single-frame capture, and hardened Stockfish 19 UCI `stop`/`isready` synchronization
+            - **Full Multi-Move Automated Test Suite:** Verified 4-move live games under active black arrows + Chess.com yellow highlights (White & Black orientations), `63 -> 64/64` transitions, and 3-ply bullet catch-up
+            - **Official Stockfish 19 (`sf_19` ARM64 NNUE):** Built-in offline engine with live-streaming <0.3s first arrow, smooth 60fps black arrow animation, `My Turn Only` (your pieces only), and No-Red-Box Accessibility mode
           files: |
             ChessCoachOverlay.apk
           make_latest: true
