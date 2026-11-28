@@ -1147,26 +1147,18 @@ object BoardVisionAnalyzer {
             sim.unmakeMove(m1, undo1)
         }
 
+        // Exact 2-ply match (64/64) returns immediately
         if (best2M1 != null && best2M2 != null &&
-            best2Score >= 62 &&
+            best2Score == 64 &&
             best2Score >= currentScore + 3 &&
             best2Score >= best1Score + 2
         ) {
             return LegalMoveMatch(listOf(best2M1, best2M2), best2Score, currentScore)
         }
 
-        // Accept solid 1-ply match (either >=62 gaining >=2, or unique >=61 gaining >=1)
-        if (best1Move != null) {
-            if (best1Score >= 62 && best1Score >= currentScore + 2) {
-                return LegalMoveMatch(listOf(best1Move), best1Score, currentScore)
-            }
-            if (best1Score >= 61 && best1Score >= currentScore + 1 && best1Score >= secondBest1Score + 1) {
-                return LegalMoveMatch(listOf(best1Move), best1Score, currentScore)
-            }
-        }
-
         // Fast changed-square-pruned 3-ply catch-up (bullet mode safety net when 3 half-moves
-        // occurred between reads). Only expands moves touching changed squares or prior move targets.
+        // occurred between reads). Checked BEFORE settling for a partial 62/64 2-ply match so
+        // 3-ply sequences like 1. e4 e5 2. Nf3 or 1. e4 d5 2. exd5 resolve cleanly to 64/64!
         if (currentScore <= 61) {
             val changedMask = collectChangedBoardSquares(currentBoard, observedScreenGrid, playingAsWhite)
             if (changedMask != 0L) {
@@ -1206,13 +1198,32 @@ object BoardVisionAnalyzer {
                 }
 
                 if (best3M1 != null && best3M2 != null && best3M3 != null &&
-                    best3Score >= 62 &&
+                    best3Score >= 63 &&
                     best3Score >= currentScore + 3 &&
-                    best3Score > best2Score &&
+                    best3Score >= best2Score + 2 &&
                     best3Score > best1Score
                 ) {
                     return LegalMoveMatch(listOf(best3M1, best3M2, best3M3), best3Score, currentScore)
                 }
+            }
+        }
+
+        // Strong near-exact 2-ply match (62-63/64)
+        if (best2M1 != null && best2M2 != null &&
+            best2Score >= 62 &&
+            best2Score >= currentScore + 3 &&
+            best2Score >= best1Score + 2
+        ) {
+            return LegalMoveMatch(listOf(best2M1, best2M2), best2Score, currentScore)
+        }
+
+        // Accept solid 1-ply match (either >=62 gaining >=2, or unique >=61 gaining >=1)
+        if (best1Move != null) {
+            if (best1Score >= 62 && best1Score >= currentScore + 2) {
+                return LegalMoveMatch(listOf(best1Move), best1Score, currentScore)
+            }
+            if (best1Score >= 61 && best1Score >= currentScore + 1 && best1Score >= secondBest1Score + 1) {
+                return LegalMoveMatch(listOf(best1Move), best1Score, currentScore)
             }
         }
 
